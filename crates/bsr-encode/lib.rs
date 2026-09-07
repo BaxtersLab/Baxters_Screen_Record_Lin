@@ -148,11 +148,17 @@ impl EncoderService {
                 // Seed-BSR-G1-03-11: wait for a frame notification, then pop
                 // from the shared ring buffer and encode.
                 _ = self.frame_notify.notified() => {
-                    let frame = {
-                        let mut buf = self.frame_buf.lock().unwrap();
-                        buf.pop()
-                    };
-                    if let Some(frame) = frame {
+                    // `Notify` holds at most one permit, so every push that lands
+                    // while this task is encoding collapses into a single wake.
+                    // Draining only one frame per wake leaves the surplus in the
+                    // ring buffer until DropOldest evicts it, losing frames with no
+                    // error reported anywhere. Drain the buffer instead.
+                    loop {
+                        let frame = {
+                            let mut buf = self.frame_buf.lock().unwrap();
+                            buf.pop()
+                        };
+                        let Some(frame) = frame else { break };
                         let start_time = std::time::Instant::now();
                         match self.backend.encode_frame(&frame) {
                             Ok(Some(packet)) => {
@@ -391,4 +397,232 @@ mod tests {
         let _ = backend.encode_frame(&frame).unwrap();
         backend.shutdown().unwrap();
     }
+
+    // ---- Timeline correctness -------------------------------------------
+    //
+    // Real capture cannot always sustain the configured fps: a damage-driven
+    // PipeWire stream on a quiet desktop, or a 1080p swscale+x264 pass that
+    // takes longer than one frame interval, both deliver fewer frames than
+    // `config.fps`. If pts is a frame counter, the file's duration becomes
+    // `frames / fps` regardless of how long the recording actually ran, so a
+    // 17 s recording is written as a 7 s file that plays ~2.3x too fast.
+    // Observed on a packaged 1.0.0-4 install: 221 frames over 17 s of wall
+    // clock, muxed as 7.33 s. pts must come from the capture timestamp.
+
+    /// Frames arriving at a real 10 fps against a 30 fps config must produce
+    /// pts spaced ~3 ticks apart (100 ms at time_base 1/30), not 1 tick.
+    #[test]
+    fn h264_pts_follows_capture_time_not_frame_count() {
+        let config = EncoderConfig {
+            codec: "h264".to_string(),
+            preset: "ultrafast".to_string(),
+            bitrate_kbps: 2000,
+            width: 320,
+            height: 240,
+            fps: 30,
+        };
+        let mut backend = backends::h264::H264EncoderBackend::new(&config).unwrap();
+        backend.initialize(&config).unwrap();
+
+        const N: u64 = 12;
+        const STEP_NS: u64 = 100_000_000; // 100 ms => 10 fps of real capture
+        let base = 1_700_000_000_000_000_000u64;
+
+        let mut pts_seen = Vec::new();
+        for i in 0..N {
+            let frame = CaptureFrame {
+                // Vary the content so x264 cannot collapse the whole run.
+                data: vec![(i as u8).wrapping_mul(37); 320 * 240 * 4],
+                timestamp: base + i * STEP_NS,
+                width: 320,
+                height: 240,
+                format: FrameFormat::Bgra8,
+            };
+            if let Some(p) = backend.encode_frame(&frame).unwrap() {
+                pts_seen.push(p.pts);
+            }
+        }
+
+        assert!(
+            pts_seen.len() >= 2,
+            "expected at least two packets, got {}",
+            pts_seen.len()
+        );
+
+        // Each 100 ms step is 3 ticks at time_base 1/30. A frame counter gives 1.
+        let gaps: Vec<i64> = pts_seen.windows(2).map(|w| w[1] - w[0]).collect();
+        let typical = gaps[gaps.len() / 2];
+        assert!(
+            typical >= 2,
+            "pts advance {typical} tick(s) per 100 ms frame; expected ~3. \
+             The encoder is stamping frame indices instead of capture \
+             timestamps, so the file's duration will not match wall clock. \
+             gaps={gaps:?} pts={pts_seen:?}"
+        );
+
+        // Total span must reflect real elapsed time, not frame count.
+        let span = pts_seen.last().unwrap() - pts_seen.first().unwrap();
+        let elapsed_ticks = ((N - 1) * STEP_NS * 30 / 1_000_000_000) as i64; // 33
+        assert!(
+            span >= elapsed_ticks - 6,
+            "pts span {span} ticks covers far less than the {elapsed_ticks} \
+             ticks of real capture time; the recording would play back sped up. \
+             pts={pts_seen:?}"
+        );
+    }
+
+    /// Two frames inside the same time_base tick must still advance pts:
+    /// x264 and the mov muxer both reject non-monotonic timestamps.
+    #[test]
+    fn h264_pts_is_strictly_increasing_for_close_frames() {
+        let config = EncoderConfig {
+            codec: "h264".to_string(),
+            preset: "ultrafast".to_string(),
+            bitrate_kbps: 2000,
+            width: 320,
+            height: 240,
+            fps: 30,
+        };
+        let mut backend = backends::h264::H264EncoderBackend::new(&config).unwrap();
+        backend.initialize(&config).unwrap();
+
+        let base = 1_700_000_000_000_000_000u64;
+        let mut pts_seen = Vec::new();
+        for i in 0..8u64 {
+            let frame = CaptureFrame {
+                data: vec![(i as u8).wrapping_mul(29); 320 * 240 * 4],
+                // 1 ms apart: all well inside one 1/30 s tick.
+                timestamp: base + i * 1_000_000,
+                width: 320,
+                height: 240,
+                format: FrameFormat::Bgra8,
+            };
+            if let Some(p) = backend.encode_frame(&frame).unwrap() {
+                pts_seen.push(p.pts);
+            }
+        }
+
+        for w in pts_seen.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "pts must strictly increase, got {:?}",
+                pts_seen
+            );
+        }
+    }
+
+    /// A capture clock that steps backwards (SystemTime is not monotonic —
+    /// NTP can slew it) must not produce a rejected or rewound stream.
+    #[test]
+    fn h264_pts_survives_a_backwards_clock() {
+        let config = EncoderConfig {
+            codec: "h264".to_string(),
+            preset: "ultrafast".to_string(),
+            bitrate_kbps: 2000,
+            width: 320,
+            height: 240,
+            fps: 30,
+        };
+        let mut backend = backends::h264::H264EncoderBackend::new(&config).unwrap();
+        backend.initialize(&config).unwrap();
+
+        let base = 1_700_000_000_000_000_000u64;
+        let stamps = [
+            base,
+            base + 100_000_000,
+            base + 50_000_000, // clock jumped backwards
+            base + 200_000_000,
+        ];
+
+        let mut pts_seen = Vec::new();
+        for (i, ts) in stamps.iter().enumerate() {
+            let frame = CaptureFrame {
+                data: vec![(i as u8).wrapping_mul(53); 320 * 240 * 4],
+                timestamp: *ts,
+                width: 320,
+                height: 240,
+                format: FrameFormat::Bgra8,
+            };
+            if let Some(p) = backend.encode_frame(&frame).unwrap() {
+                pts_seen.push(p.pts);
+            }
+        }
+
+        for w in pts_seen.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "a backwards capture clock must not rewind pts, got {:?}",
+                pts_seen
+            );
+        }
+    }
+
+
+    /// `Notify` stores at most one permit, so frames pushed while the encoder is
+    /// busy collapse into a single wake. If the service pops only one frame per
+    /// wake the rest sit in the ring buffer until some later push, and are
+    /// eventually evicted by DropOldest — the recording loses frames with no
+    /// error anywhere. The service must drain the buffer on each wake.
+    #[tokio::test]
+    #[cfg_attr(windows, ignore = "requires hardware MFT H.264 encoder")]
+    async fn encoder_service_drains_every_buffered_frame_per_wake() {
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::Notify;
+        use bsr_core::buffer::DropOldestBuffer;
+
+        let config = EncoderConfig {
+            codec: "h264".to_string(),
+            preset: "ultrafast".to_string(),
+            bitrate_kbps: 2000,
+            width: 320,
+            height: 240,
+            fps: 30,
+        };
+        let (telemetry_tx, _) = broadcast::channel(32);
+        let (packet_tx, _packet_rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+        let frame_buf = Arc::new(Mutex::new(DropOldestBuffer::new(32)));
+        let frame_notify = Arc::new(Notify::new());
+
+        let service = EncoderService::new(
+            config, telemetry_tx, frame_buf.clone(), frame_notify.clone(),
+            packet_tx, shutdown_rx,
+        ).unwrap();
+        let handle = tokio::spawn(async move { service.run().await.unwrap(); });
+
+        // Fill the buffer, then wake exactly once: the collapse case.
+        const N: usize = 8;
+        for i in 0..N {
+            frame_buf.lock().unwrap().push(CaptureFrame {
+                data: vec![(i as u8).wrapping_mul(31); 320 * 240 * 4],
+                timestamp: 1_700_000_000_000_000_000u64 + (i as u64) * 33_000_000,
+                width: 320,
+                height: 240,
+                format: FrameFormat::Bgra8,
+            });
+        }
+        frame_notify.notify_one();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let left = frame_buf.lock().unwrap().len();
+            if left == 0 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                shutdown_tx.send(()).await.ok();
+                panic!(
+                    "{left} of {N} frames left in the ring buffer after a single \
+                     wake — the encoder drains only one frame per notification, so \
+                     frames pushed while it was busy are lost to DropOldest"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        shutdown_tx.send(()).await.unwrap();
+        handle.await.unwrap();
+    }
+
 }

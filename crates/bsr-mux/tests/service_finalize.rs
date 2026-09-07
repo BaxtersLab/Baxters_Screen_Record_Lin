@@ -101,7 +101,16 @@ fn assert_decodable(path: &std::path::Path) {
     assert!(decoded > 0, "container opened but no frames decoded out of it");
 }
 
-async fn run_service_until_packets_end(finish: Option<MuxerCommand>) -> std::path::PathBuf {
+/// Returns the `TempDir` guard alongside the path: the caller must hold the guard
+/// until it has finished reading the file. An earlier version copied the output to
+/// `temp_dir()/bsr-svc-finalize-<pid>.mp4`, but both tests in this binary run in
+/// parallel threads of one process, so they raced on that single shared name — one
+/// test's `remove_file` deleted the other's output mid-read ("No such file or
+/// directory", 0 bytes) or its `copy` overwrote a file being decoded ("Invalid data
+/// found"). Roughly one run in three failed, in whichever test lost.
+async fn run_service_until_packets_end(
+    finish: Option<MuxerCommand>,
+) -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path().to_path_buf();
 
@@ -146,25 +155,25 @@ async fn run_service_until_packets_end(finish: Option<MuxerCommand>) -> std::pat
         .expect("muxer task panicked")
         .expect("muxer returned an error");
 
-    // Copy out before the tempdir is dropped.
-    let kept = std::env::temp_dir().join(format!("bsr-svc-finalize-{}.mp4", std::process::id()));
-    std::fs::copy(&out, &kept).unwrap_or_else(|e| panic!("no output at {}: {e}", out.display()));
-    kept
+    assert!(
+        out.exists(),
+        "muxer produced no output at {}",
+        out.display()
+    );
+    (tmp, out)
 }
 
 /// The real-world path: the encoder shuts down, its sender drops, and nothing sends an
 /// explicit stop. The file must still be playable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn packet_stream_ending_finalizes_the_mp4() {
-    let path = run_service_until_packets_end(None).await;
+    let (_tmp, path) = run_service_until_packets_end(None).await;
     assert_decodable(&path);
-    let _ = std::fs::remove_file(&path);
 }
 
 /// The explicit path, for completeness: an operator pressing Stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_stop_finalizes_the_mp4() {
-    let path = run_service_until_packets_end(Some(MuxerCommand::StopRecording)).await;
+    let (_tmp, path) = run_service_until_packets_end(Some(MuxerCommand::StopRecording)).await;
     assert_decodable(&path);
-    let _ = std::fs::remove_file(&path);
 }

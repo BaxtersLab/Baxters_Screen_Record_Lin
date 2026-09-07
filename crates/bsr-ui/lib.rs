@@ -80,6 +80,10 @@ pub struct UiSettings {
     pub crop_bottom: u32,
     /// Get BSR's own window out of the shot while recording.
     pub minimize_while_recording: bool,
+    /// x264 preset the encoder runs with, from `encoder.preset` in the config.
+    pub preset: String,
+    /// Target bitrate in kbit/s, from `encoder.bitrate_kbps` in the config.
+    pub bitrate_kbps: u32,
 }
 
 impl Default for UiSettings {
@@ -94,7 +98,29 @@ impl Default for UiSettings {
             crop_right: 0,
             crop_bottom: 0,
             minimize_while_recording: true,
+            preset: bsr_encode::EncoderConfig::default().preset,
+            bitrate_kbps: bsr_encode::EncoderConfig::default().bitrate_kbps,
         }
+    }
+}
+
+/// Build the encoder configuration the recording pipeline runs with.
+///
+/// Extracted so the config -> encoder path can be tested: `encoder.preset` and
+/// `encoder.bitrate_kbps` are serialized into every config file, and were read
+/// by nothing, so an operator or agent that set them changed nothing.
+pub fn encoder_config_for(
+    settings: &UiSettings,
+    width: u32,
+    height: u32,
+) -> bsr_encode::EncoderConfig {
+    bsr_encode::EncoderConfig {
+        codec: "h264".to_string(),
+        preset: settings.preset.clone(),
+        bitrate_kbps: settings.bitrate_kbps,
+        width,
+        height,
+        fps: settings.fps,
     }
 }
 
@@ -922,6 +948,13 @@ impl AppWindow {
         if config.capture.fps > 0 {
             settings.fps = config.capture.fps;
         }
+        // `encoder.preset` and `encoder.bitrate_kbps` were serialized into every
+        // config file and read by nothing, so setting them changed nothing about
+        // the recording. They arrive here now.
+        settings.preset = config.encoder.preset.x264_name().to_string();
+        if config.encoder.bitrate_kbps > 0 {
+            settings.bitrate_kbps = config.encoder.bitrate_kbps;
+        }
         settings.set_capture_region(config.capture.region);
         // Determine initial fragment sequence by reading a small state file
         let initial_seq = {
@@ -1704,10 +1737,7 @@ impl AppWindow {
         );
 
         // Create encoder service with H.264 backend, sized to the cropped frame.
-        let mut encoder_config = bsr_encode::EncoderConfig::default();
-        encoder_config.width = rec_w;
-        encoder_config.height = rec_h;
-        encoder_config.fps = self.model.settings.fps;
+        let encoder_config = encoder_config_for(&self.model.settings, rec_w, rec_h);
         let encoder_service = match bsr_encode::EncoderService::new(
             encoder_config.clone(),
             telem_broadcast_tx,
@@ -3139,5 +3169,36 @@ mod tests {
         assert!(folder_edit_hover.contains("folder"));
         assert!(naming_hover.contains("how each recording file will be named"));
     }
-}
 
+    /// `encoder.preset` and `encoder.bitrate_kbps` are written into every config
+    /// file. Nothing read them: the pipeline built `EncoderConfig::default()` and
+    /// overrode only width/height/fps, so both knobs were undeclared stubs and an
+    /// operator or agent setting them changed nothing about the recording.
+    #[test]
+    fn configured_preset_and_bitrate_reach_the_encoder() {
+        for (tier, want) in [
+            (bsr_core::config::EncoderPreset::Fast, "ultrafast"),
+            (bsr_core::config::EncoderPreset::Balanced, "superfast"),
+            (bsr_core::config::EncoderPreset::Quality, "veryfast"),
+        ] {
+            let mut config = BsrConfig::default();
+            config.encoder.preset = tier.clone();
+            config.encoder.bitrate_kbps = 12_345;
+
+            let ctx = egui::Context::default();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let app = AppWindow::new_headless(&ctx, config, rt.handle().clone(), None);
+
+            let enc = encoder_config_for(&app.model.settings, 1920, 1080);
+            assert_eq!(
+                enc.preset, want,
+                "config encoder.preset {tier:?} must reach the encoder as {want}"
+            );
+            assert_eq!(
+                enc.bitrate_kbps, 12_345,
+                "config encoder.bitrate_kbps must reach the encoder"
+            );
+        }
+    }
+
+}

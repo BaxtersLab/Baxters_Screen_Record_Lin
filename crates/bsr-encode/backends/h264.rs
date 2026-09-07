@@ -7,7 +7,14 @@ pub struct H264EncoderBackend {
     encoder: ffmpeg::encoder::video::Encoder,
     frame: ffmpeg::util::frame::Video,
     scaler: ffmpeg::software::scaling::Context,
-    pts: i64,
+    /// Denominator of the encoder time_base (which is 1/fps), used to convert
+    /// capture timestamps into pts ticks.
+    fps: i64,
+    /// Capture timestamp of the first encoded frame; pts is measured from it.
+    first_ts: Option<u64>,
+    /// Last pts emitted, so pts stays strictly increasing when two frames land
+    /// in the same tick or the capture clock steps backwards.
+    last_pts: Option<i64>,
 }
 
 // Safety: H264EncoderBackend is only used from a single tokio task.
@@ -61,7 +68,9 @@ impl H264EncoderBackend {
             encoder,
             frame,
             scaler,
-            pts: 0,
+            fps: config.fps.max(1) as i64,
+            first_ts: None,
+            last_pts: None,
         })
     }
 
@@ -98,8 +107,26 @@ impl H264EncoderBackend {
         self.scaler.run(&src_frame, &mut self.frame)
             .map_err(|e| EncoderError::Encoding(e.to_string()))?;
 
-        self.frame.set_pts(Some(self.pts));
-        self.pts += 1;
+        // pts must track real capture time, not frame count. Capture routinely
+        // delivers fewer frames than `fps` — a damage-driven PipeWire stream on
+        // a quiet desktop repeats slowly, and a 1080p scale+encode can take
+        // longer than one frame interval — and a counter would then write a
+        // file shorter than the recording, played back sped up, with no error.
+        let base = *self.first_ts.get_or_insert(frame.timestamp);
+        let elapsed_ns = frame.timestamp.saturating_sub(base) as i128;
+        let mut pts = (elapsed_ns * self.fps as i128 / 1_000_000_000) as i64;
+
+        // Keep pts strictly increasing: two frames can share a tick, and the
+        // capture clock is SystemTime, which NTP can step backwards. x264 and
+        // the mov muxer both reject non-monotonic timestamps.
+        if let Some(last) = self.last_pts {
+            if pts <= last {
+                pts = last + 1;
+            }
+        }
+        self.last_pts = Some(pts);
+
+        self.frame.set_pts(Some(pts));
 
         self.encoder.send_frame(&self.frame)
             .map_err(|e| EncoderError::Encoding(e.to_string()))?;

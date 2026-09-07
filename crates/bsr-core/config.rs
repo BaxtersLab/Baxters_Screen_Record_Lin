@@ -197,11 +197,38 @@ pub enum VideoCodec {
     H265,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EncoderPreset {
     Fast,
     Balanced,
     Quality,
+}
+
+impl EncoderPreset {
+    /// The x264 preset name this tier maps to.
+    ///
+    /// Chosen against a measurement on the reference box (1920x1080, release
+    /// build, BGRA->YUV420P scale plus encode, per frame):
+    ///
+    /// | x264 preset | ms/frame | sustainable fps |
+    /// |-------------|----------|-----------------|
+    /// | fast        | 46.4     | 21.6            |
+    /// | veryfast    | 36.8     | 27.2            |
+    /// | superfast   | 26.9     | 37.1            |
+    /// | ultrafast   | 22.1     | 45.2            |
+    ///
+    /// A screen recorder that cannot sustain its target frame rate sheds
+    /// frames in the capture loop, so `Balanced` is the fastest tier with real
+    /// headroom over 30 fps rather than the nominally "balanced" x264 name.
+    /// `Quality` deliberately trades frame rate for picture and may not hold
+    /// 30 fps at 1080p.
+    pub fn x264_name(&self) -> &'static str {
+        match self {
+            EncoderPreset::Fast => "ultrafast",
+            EncoderPreset::Balanced => "superfast",
+            EncoderPreset::Quality => "veryfast",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -250,3 +250,101 @@ async fn a_recording_is_not_playable_until_the_muxer_finishes() {
     assert_eq!((w, h), (SCREEN_W, SCREEN_H));
     assert!(frames > 0, "playable only after the muxer completes");
 }
+
+/// Container duration in seconds, as any player would read it.
+fn container_duration_secs(path: &std::path::Path) -> f64 {
+    ffmpeg::init().expect("ffmpeg init");
+    let ictx = ffmpeg::format::input(&path).expect("open produced file");
+    // `duration()` is in AV_TIME_BASE units (microseconds).
+    ictx.duration() as f64 / 1_000_000.0
+}
+
+/// **A recording must be as long as the recording actually was.**
+///
+/// Capture cannot always sustain the configured fps: a damage-driven PipeWire
+/// stream on a quiet desktop repeats slowly, and at 1080p the BGRA->YUV420P
+/// scale plus x264 pass can exceed one frame interval outright. Measured on the
+/// reference box, x264 preset "fast" sustains 21.6 fps at 1080p against a 30 fps
+/// target.
+///
+/// While pts was a frame counter, the file's duration was always
+/// `frames / fps` no matter how long the recording ran, so an underrun wrote a
+/// short file that played back sped up, with nothing reported as wrong.
+/// Observed on a packaged 1.0.0-4 install: 17 s of recording, 221 frames, muxed
+/// as a 7.33 s file — roughly 2.3x too fast.
+///
+/// This drives the real encoder and the real `MuxerService` with frames arriving
+/// at a genuine 10 fps against a 30 fps configuration, and reads the duration
+/// back out of the container.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_duration_matches_real_capture_time_when_capture_underruns() {
+    const N: usize = 30;
+    const STEP_NS: u64 = 100_000_000; // 100 ms apart => 10 fps of real capture
+    let real_secs = (N as f64 - 1.0) * STEP_NS as f64 / 1e9; // 2.9 s
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = bsr_ipc::MuxerConfig {
+        base_output_path: dir.path().to_path_buf(),
+        file_naming_strategy: bsr_ipc::FileNamingStrategy::Simple("slow.mp4".into()),
+        max_duration: Duration::from_secs(3600),
+        fps: FPS,
+        width: SCREEN_W,
+        height: SCREEN_H,
+        ..Default::default()
+    };
+    let out = cfg.preview_output_path();
+
+    let enc_cfg = EncoderConfig {
+        codec: "h264".into(),
+        preset: "ultrafast".into(),
+        bitrate_kbps: 2500,
+        width: SCREEN_W,
+        height: SCREEN_H,
+        fps: FPS,
+    };
+    let mut enc = H264EncoderBackend::new(&enc_cfg).expect("encoder init");
+    enc.initialize(&enc_cfg).expect("encoder initialize");
+
+    let (packet_tx, packet_rx) = tokio::sync::mpsc::channel(64);
+    let (telemetry_tx, _telemetry_rx) = tokio::sync::mpsc::channel(4);
+    let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(1);
+    let (ipc_cmd_tx, _ipc_cmd_rx) = tokio::sync::mpsc::channel(32);
+    let service = MuxerService::new(
+        cfg, Mp4Muxer::new(), packet_rx, telemetry_tx, cmd_rx,
+        bsr_ipc::IpcClient::new(ipc_cmd_tx),
+    );
+    let muxer = tokio::spawn(async move { service.run().await });
+
+    let base = 1_700_000_000_000_000_000u64;
+    for i in 0..N {
+        let mut frame = screen_frame(i);
+        frame.timestamp = base + i as u64 * STEP_NS;
+        if let Some(p) = enc.encode_frame(&frame).expect("encode_frame") {
+            packet_tx
+                .send(EncodedPacket { data: p.data, pts: p.pts, dts: p.dts, keyframe: p.keyframe })
+                .await
+                .expect("muxer dropped its receiver");
+        }
+    }
+    drop(packet_tx);
+    tokio::time::timeout(Duration::from_secs(20), muxer)
+        .await
+        .expect("muxer did not finish")
+        .expect("muxer panicked")
+        .expect("muxer errored");
+
+    let (w, h, frames) = decode(&out);
+    assert_eq!((w, h), (SCREEN_W, SCREEN_H));
+    assert!(frames > 0, "container opened but decoded no frames");
+
+    let got = container_duration_secs(&out);
+    let counter_secs = N as f64 / FPS as f64; // 1.0 s — what a frame counter writes
+    assert!(
+        (got - real_secs).abs() < 0.35,
+        "file reports {got:.2}s for {real_secs:.2}s of real capture \
+         ({N} frames, 100 ms apart, at a {FPS} fps configuration). A frame \
+         counter would write ~{counter_secs:.2}s and play back \
+         {:.1}x too fast.",
+        real_secs / got.max(0.001)
+    );
+}
