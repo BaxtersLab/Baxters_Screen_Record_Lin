@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Build baxters-screen-record_<version>_amd64.deb per the A1 packaging contract.
 #
 # Contract points this implements, so the next reader does not have to re-derive them:

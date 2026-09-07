@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Baxter's Screen Record — supported entry point on Linux (CLAUDE.md; packaging
 # contract A1 §3). Launch the app through this script, never by execing the binary.
 set -euo pipefail

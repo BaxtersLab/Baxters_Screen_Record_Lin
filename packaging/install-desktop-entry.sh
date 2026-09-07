@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Install (or remove) the Baxter's Screen Record launcher for the current user.
 #
 # User-scope only: everything lands under $XDG_DATA_HOME (default ~/.local/share),

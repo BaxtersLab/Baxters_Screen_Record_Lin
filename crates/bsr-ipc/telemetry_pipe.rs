@@ -20,6 +20,32 @@ pub struct FrameInfo {
 ///   Reconnects on failure.
 /// - On non-Windows: writes JSON lines to a log file at env `BSR_TELEMETRY_LOG`
 ///   (useful for tests).
+/// Where the non-Windows telemetry log goes.
+///
+/// `BSR_TELEMETRY_LOG` overrides it. The default was the bare relative name
+/// `bsr_telemetry.log`, which resolves against the current directory — `/` for an app
+/// started from the desktop — so it failed with "Permission denied" on every launch
+/// that was not from a writable shell. Same shape as the config path defect: a
+/// relative default is a different file depending on who started the process.
+#[cfg(not(target_os = "windows"))]
+fn default_telemetry_log_path() -> std::path::PathBuf {
+    if let Ok(explicit) = std::env::var("BSR_TELEMETRY_LOG") {
+        if !explicit.trim().is_empty() {
+            return std::path::PathBuf::from(explicit);
+        }
+    }
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|h| h.join(".local").join("state"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("bsr").join("telemetry.log")
+}
+
 pub async fn telemetry_client(mut rx: mpsc::Receiver<FrameInfo>, pipe_path: String) {
     #[cfg(target_os = "windows")]
     {
@@ -181,11 +207,23 @@ pub async fn telemetry_client(mut rx: mpsc::Receiver<FrameInfo>, pipe_path: Stri
         use std::fs::OpenOptions;
         use std::io::Write;
 
-        let log_path = std::env::var("BSR_TELEMETRY_LOG").unwrap_or_else(|_| "bsr_telemetry.log".to_string());
+        let log_path = default_telemetry_log_path();
+        if let Some(dir) = log_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let mut file = match OpenOptions::new().create(true).append(true).open(&log_path) {
             Ok(f) => f,
             Err(e) => {
-                error!(%e, "failed to open telemetry log file, aborting telemetry client");
+                // Best-effort diagnostics, never a failure of the application. This
+                // was `error!` on a path relative to the current directory, so a
+                // launcher-started app (cwd `/`) logged an ERROR about Permission
+                // denied on every recording — a red herring sitting next to a real
+                // capture failure while it was being diagnosed.
+                warn!(
+                    %e,
+                    path = %log_path.display(),
+                    "telemetry log unavailable; continuing without it"
+                );
                 return;
             }
         };
@@ -220,6 +258,48 @@ pub async fn telemetry_client(mut rx: mpsc::Receiver<FrameInfo>, pipe_path: Stri
 
 #[cfg(all(test, not(target_os = "windows")))]
 mod tests {
+
+    /// The default was the bare relative name `bsr_telemetry.log`, so it resolved
+    /// against the current directory. An app launched from the desktop has cwd `/`,
+    /// which is not writable, so telemetry aborted with "Permission denied" on every
+    /// single launch that was not from a shell.
+    #[test]
+    fn the_default_telemetry_log_path_is_absolute() {
+        let saved = std::env::var("BSR_TELEMETRY_LOG").ok();
+        std::env::remove_var("BSR_TELEMETRY_LOG");
+
+        let p = super::default_telemetry_log_path();
+        assert!(
+            p.is_absolute(),
+            "default telemetry log path {p:?} is relative, so it lands wherever the \
+             process happened to be started from"
+        );
+        assert!(
+            p.parent().is_some(),
+            "path {p:?} has no parent directory to create"
+        );
+
+        if let Some(v) = saved {
+            std::env::set_var("BSR_TELEMETRY_LOG", v);
+        }
+    }
+
+    /// An explicit override must still win, and be taken verbatim.
+    #[test]
+    fn an_explicit_telemetry_log_path_wins() {
+        let saved = std::env::var("BSR_TELEMETRY_LOG").ok();
+        let dir = tempfile::tempdir().unwrap();
+        let want = dir.path().join("chosen.log");
+        std::env::set_var("BSR_TELEMETRY_LOG", &want);
+
+        assert_eq!(super::default_telemetry_log_path(), want);
+
+        std::env::remove_var("BSR_TELEMETRY_LOG");
+        if let Some(v) = saved {
+            std::env::set_var("BSR_TELEMETRY_LOG", v);
+        }
+    }
+
     use super::*;
     use tempfile::NamedTempFile;
 
