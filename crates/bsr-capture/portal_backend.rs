@@ -31,7 +31,6 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gstreamer as gst;
@@ -77,9 +76,8 @@ struct PortalStream {
 /// Owns the D-Bus connection thread. Dropping it closes the portal session.
 struct PortalConnection {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    thread: Option<JoinHandle<()>>,
-    /// Signalled by the portal thread just before it returns, so `drop` can wait a
-    /// bounded time instead of joining forever.
+    /// Signalled by the session task just before it returns, so `drop` can wait a
+    /// bounded time instead of blocking forever.
     exited: std::sync::Mutex<mpsc::Receiver<()>>,
 }
 
@@ -88,30 +86,16 @@ impl Drop for PortalConnection {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
-        if let Some(t) = self.thread.take() {
-            // A plain `join()` here is unbounded, and this runs inside an async task:
-            // it blocks a tokio worker thread and `tokio::time::timeout` cannot cancel
-            // it, because the blocking call happens inside the future's poll. Measured
-            // on this box: shutting a backend down could sit in this join for over
-            // 150 s. Wait a bounded time, then detach — a leaked parked thread is a far
-            // smaller problem than an application that never returns from Stop.
-            let waited = self
-                .exited
-                .get_mut()
-                .map(|rx| rx.recv_timeout(Duration::from_secs(3)))
-                .unwrap_or(Ok(()));
-            match waited {
-                Ok(()) => {
-                    let _ = t.join();
-                }
-                Err(_) => {
-                    warn!(
-                        "portal D-Bus thread did not exit within 3s; detaching it rather \
-                         than blocking. The session will close when the process does."
-                    );
-                    drop(t); // detach
-                }
-            }
+        // Bounded: the session task closes the portal session and signals. If it does
+        // not, carry on rather than blocking the caller — a leaked session is released
+        // when the process exits, whereas a blocked Stop strands the operator.
+        let waited = self
+            .exited
+            .get_mut()
+            .map(|rx| rx.recv_timeout(Duration::from_secs(3)))
+            .unwrap_or(Ok(()));
+        if waited.is_err() {
+            warn!("portal session did not confirm close within 3s; continuing");
         }
     }
 }
@@ -290,9 +274,13 @@ fn start_live() -> Result<Live, CaptureError> {
         ));
     }
 
+    info!("capture start: environment ok, opening portal session");
     let (stream, connection) = start_portal_session().map_err(init)?;
+    info!(node = stream.node_id, "capture start: portal session granted");
 
+    info!("capture start: initialising GStreamer");
     gst::init().map_err(|e| init(format!("gst::init: {e}")))?;
+    info!("capture start: GStreamer ready, building pipeline");
 
     // BGRA to match what the H.264 backend's swscale context expects (see module docs).
     //
@@ -477,80 +465,89 @@ fn cursor_mode() -> ashpd::desktop::screencast::CursorMode {
 /// Run the ScreenCast handshake on a dedicated thread and keep that thread — and
 /// therefore the D-Bus connection and the portal session — alive until the returned
 /// [`PortalConnection`] is dropped.
+/// The one portal runtime for this process.
+///
+/// zbus caches the session-bus connection **process-wide**, and that connection is
+/// driven by whichever executor first created it. The previous code built a fresh
+/// `current_thread` runtime on a per-session thread and let that thread exit when the
+/// session was shut down, which left the cached connection with no executor to drive
+/// it: the *next* `Screencast::new()` blocked forever and BSR recorded nothing, with
+/// no error anywhere.
+///
+/// Measured with `examples/two_sessions.rs`: session A reaches "proxy ready" in 5.8 ms;
+/// session B, opened after A was closed, never returns from `Screencast::new()`. This
+/// is why the recording produced an empty file whenever the idle live view had been
+/// used first, and why it worked when it had not.
+///
+/// Never dropped, so the connection always has somewhere to run.
+fn portal_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("bsr-portal")
+            .enable_all()
+            .build()
+            .expect("build the portal runtime")
+    })
+}
+
+/// How long to wait for the portal to answer a handshake before giving up. The portal
+/// may show a picker dialog, so this has to allow for a person reading it.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Run the ScreenCast handshake on the shared portal runtime and keep the session
+/// alive until the returned [`PortalConnection`] is dropped.
 fn start_portal_session() -> Result<(PortalStream, PortalConnection), String> {
     let (ready_tx, ready_rx) = mpsc::channel::<Result<PortalStream, String>>();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    // Sent on every exit path (including panics, via the guard's Drop), so a dropped
-    // PortalConnection never waits on a thread that is already gone.
     let (exited_tx, exited_rx) = mpsc::channel::<()>();
 
-    let thread = std::thread::Builder::new()
-        .name("bsr-portal".into())
-        .spawn(move || {
-            struct ExitSignal(mpsc::Sender<()>);
-            impl Drop for ExitSignal {
-                fn drop(&mut self) {
-                    let _ = self.0.send(());
-                }
+    info!("portal: dispatching handshake to the shared portal runtime");
+    portal_runtime().spawn(async move {
+        // Fires on every exit path, so a dropped PortalConnection never waits on a
+        // task that has already gone.
+        struct ExitSignal(mpsc::Sender<()>);
+        impl Drop for ExitSignal {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
             }
-            let _exit = ExitSignal(exited_tx);
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(format!("tokio runtime: {e}")));
+        }
+        let _exit = ExitSignal(exited_tx);
+
+        match handshake().await {
+            Ok((session, stream)) => {
+                if ready_tx.send(Ok(stream)).is_err() {
+                    let _ = session.close().await;
                     return;
                 }
-            };
-            rt.block_on(async move {
-                match handshake().await {
-                    Ok((session, stream)) => {
-                        if ready_tx.send(Ok(stream)).is_err() {
-                            let _ = session.close().await;
-                            return;
-                        }
-                        // Park here holding the connection open. The portal tears the
-                        // session down the instant this thread's zbus connection goes away.
-                        let _ = shutdown_rx.await;
-                        // `close()` can never return — measured on this box, it left the
-                        // thread parked indefinitely, so the caller's join blocked forever
-                        // AND the portal never learned the session was finished. GNOME then
-                        // still considered the cast active, and the next session BSR opened
-                        // was granted but delivered no frames at all. Bound it: the session
-                        // is released either way when this thread's zbus connection drops.
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
-                            session.close(),
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                    }
-                }
-            });
-        })
-        .map_err(|e| format!("spawn portal thread: {e}"))?;
-
-    let stream = match ready_rx.recv() {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            let _ = thread.join();
-            return Err(e);
+                // Hold the session open until the owner drops.
+                let _ = shutdown_rx.await;
+                let _ = tokio::time::timeout(Duration::from_secs(5), session.close()).await;
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+            }
         }
-        Err(_) => {
-            let _ = thread.join();
-            return Err("portal thread exited without answering".into());
+    });
+
+    info!("portal: waiting for handshake result");
+    let stream = match ready_rx.recv_timeout(HANDSHAKE_TIMEOUT) {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err(format!(
+                "the desktop portal did not answer within {HANDSHAKE_TIMEOUT:?} — the \
+                 screen-share dialog may be waiting for a response, or the portal may \
+                 not be running (check xdg-desktop-portal-gnome)"
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err("portal handshake task exited without answering".into())
         }
     };
 
-    Ok((
-        stream,
-        PortalConnection {
-            shutdown: Some(shutdown_tx),
-            thread: Some(thread),
-            exited: std::sync::Mutex::new(exited_rx),
-        },
-    ))
+    Ok((stream, PortalConnection { shutdown: Some(shutdown_tx), exited: std::sync::Mutex::new(exited_rx) }))
 }
 
 async fn handshake() -> Result<
@@ -562,9 +559,11 @@ async fn handshake() -> Result<
     };
     use ashpd::desktop::{CreateSessionOptions, PersistMode};
 
+    info!("handshake: connecting to ScreenCast portal");
     let proxy = Screencast::new()
         .await
         .map_err(|e| format!("connect to ScreenCast portal: {e}"))?;
+    info!("handshake: proxy ready, creating session");
     let session = proxy
         .create_session(CreateSessionOptions::default())
         .await
@@ -582,6 +581,7 @@ async fn handshake() -> Result<
     if let Some(tok) = restore.as_deref() {
         opts = opts.set_restore_token(tok);
     }
+    info!("handshake: session created, selecting sources");
     proxy
         .select_sources(&session, opts)
         .await
@@ -589,6 +589,7 @@ async fn handshake() -> Result<
         .response()
         .map_err(|e| format!("SelectSources refused: {e}"))?;
 
+    info!("handshake: sources selected, starting cast");
     let streams = proxy
         .start(&session, None, StartCastOptions::default())
         .await

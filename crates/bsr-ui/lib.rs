@@ -605,7 +605,12 @@ pub struct AppWindow {
     bsr_debug: bool,
     pending_consent: Option<(Option<String>, tokio::sync::oneshot::Sender<bool>)>,
     // Preview channel for UI frames (resized RGBA)
-    preview_rx: Option<mpsc::UnboundedReceiver<PreviewImage>>,
+    /// Latest preview images. **Bounded**: while BSR is minimised — which is the
+    /// default for the whole length of a recording — egui does not call `tick`, so
+    /// nothing drains this. Unbounded, it grew by roughly half a megabyte five times a
+    /// second for the entire take. Only the newest image is ever displayed, so a full
+    /// channel drops rather than queues.
+    preview_rx: Option<mpsc::Receiver<PreviewImage>>,
     preview_texture: Option<egui::TextureHandle>,
     ipc_client: Option<bsr_ipc::IpcClient>,
     recording_start: Option<std::time::Instant>,
@@ -1906,7 +1911,7 @@ impl AppWindow {
 
         // Preview channel: the background task scales the capture service's own
         // preview copy and sends RGBA to the UI. It never touches `frame_buf`.
-        let (preview_tx, preview_rx) = mpsc::unbounded_channel::<PreviewImage>();
+        let (preview_tx, preview_rx) = mpsc::channel::<PreviewImage>(2);
         // store receiver so UI can poll it
         self.preview_rx = Some(preview_rx);
 
@@ -1942,7 +1947,7 @@ impl AppWindow {
                         let dynimg = image::DynamicImage::ImageRgba8(img_buf);
                         let resized = image::imageops::resize(&dynimg, target_w, target_h, FilterType::Triangle);
                         let data = resized.into_raw();
-                        let _ = preview_tx.send(PreviewImage { width: target_w, height: target_h, data });
+                        let _ = preview_tx.try_send(PreviewImage { width: target_w, height: target_h, data });
                     } else {
                         // Fallback: send unresized RGBA (may be heavy)
                         let mut fallback_rgba = Vec::with_capacity(f.data.len());
@@ -1958,7 +1963,7 @@ impl AppWindow {
                             fallback_rgba.push(b);
                             fallback_rgba.push(a);
                         }
-                        let _ = preview_tx.send(PreviewImage { width: f.width, height: f.height, data: fallback_rgba });
+                        let _ = preview_tx.try_send(PreviewImage { width: f.width, height: f.height, data: fallback_rgba });
                     }
                 }
             }
@@ -2261,7 +2266,7 @@ impl AppWindow {
         if self.live_view.is_some() || matches!(self.model.status, RecordingStatus::Recording) {
             return;
         }
-        let (preview_tx, preview_rx) = mpsc::unbounded_channel::<PreviewImage>();
+        let (preview_tx, preview_rx) = mpsc::channel::<PreviewImage>(2);
         self.preview_rx = Some(preview_rx);
         let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
         let error = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
@@ -2302,8 +2307,13 @@ impl AppWindow {
                         match backend.capture_frame().await {
                             Ok(frame) => {
                                 if let Some(p) = frame_to_preview(&frame, 480) {
-                                    if preview_tx.send(p).is_err() {
-                                        break; // UI dropped the receiver
+                                    // A full channel means the UI is not drawing (it
+                                    // is minimised); drop the frame. Only a closed
+                                    // channel means there is no one left to draw for.
+                                    if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
+                                        preview_tx.try_send(p)
+                                    {
+                                        break;
                                     }
                                 }
                             }

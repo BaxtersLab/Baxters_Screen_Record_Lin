@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Two overlapping ScreenCast sessions, and — the part that used to hang — shutting
-//! both of them down. `PortalConnection::drop` joined its D-Bus thread with no bound;
-//! this probe sat in that join for over 150 s before the join was made bounded.
+//! The field sequence: an idle live-view session runs for a few seconds, is shut
+//! down, and a recording session is opened immediately afterwards.
 //!
 //! ```sh
 //! env -u GDK_BACKEND cargo run -p bsr-capture --example two_sessions
@@ -29,28 +28,35 @@ async fn frames(tag: &str, b: &mut PortalCaptureBackend, n: usize) -> usize {
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
+    let t0 = Instant::now();
+    macro_rules! step {
+        ($($a:tt)*) => { println!("[{:>8.3}s] {}", t0.elapsed().as_secs_f64(), format!($($a)*)) };
+    }
 
+    step!("A.initialize() — the idle live view");
     let mut a = PortalCaptureBackend::new();
     if let Err(e) = a.initialize().await {
-        println!("A failed: {e}");
+        step!("A failed: {e}");
         return;
     }
-    println!("A frames: {}", frames("A", &mut a, 5).await);
+    step!("A live; running it for 7s like the operator does");
+    step!("A frames: {}", frames("A", &mut a, 20).await);
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
+    step!("A.shutdown() — what pressing Record triggers first");
+    a.shutdown().await.ok();
+    step!("A.shutdown() returned");
+
+    step!("B.initialize() — the recording session");
     let mut b = PortalCaptureBackend::new();
-    if let Err(e) = b.initialize().await {
-        println!("B failed to initialise: {e}");
-        return;
+    match b.initialize().await {
+        Ok(()) => step!("B initialised"),
+        Err(e) => {
+            step!("B FAILED: {e}");
+            return;
+        }
     }
-    println!("B frames: {}", frames("B", &mut b, 5).await);
-
-    let t = Instant::now();
-    let _ = a.shutdown().await;
-    println!("A.shutdown() in {:?}", t.elapsed());
-
-    let t = Instant::now();
-    let _ = b.shutdown().await;
-    println!("B.shutdown() in {:?}", t.elapsed());
-
-    println!("[done] both sessions closed without hanging");
+    step!("B frames: {} / 30", frames("B", &mut b, 30).await);
+    step!("done");
+    std::process::exit(0);
 }
