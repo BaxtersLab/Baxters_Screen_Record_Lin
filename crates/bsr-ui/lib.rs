@@ -579,6 +579,14 @@ pub struct AppWindow {
     pending_save_offer: Option<(String, tokio::sync::oneshot::Sender<Option<String>>)>,
     // Local save modal state (starter's save dialog)
     pending_local_save: Option<String>,
+    /// Built by `new_headless`: no tray, no global hotkeys, and no portal session.
+    headless: bool,
+    /// Was the idle live view running when this recording started?
+    ///
+    /// The live view has to stand down for the duration (the recording feeds the
+    /// preview from its own session), but it used to simply never come back, so an
+    /// operator who turned it on found it gone after every recording.
+    live_view_was_on: bool,
     /// Where "Save" will copy to. Kept separate from `settings.output_folder`, which is
     /// where recordings are WRITTEN -- defaulting the destination to the source folder is
     /// what made the default Save destructive.
@@ -938,7 +946,9 @@ impl AppWindow {
         handle: tokio::runtime::Handle,
         ipc_client: Option<bsr_ipc::IpcClient>,
     ) -> Self {
-        Self::assemble(ctx, config, handle, None, ipc_client, false)
+        let mut app = Self::assemble(ctx, config, handle, None, ipc_client, false);
+        app.headless = true;
+        app
     }
 
     fn assemble(
@@ -1059,6 +1069,8 @@ impl AppWindow {
             preview_texture: None,
             ipc_client,
             pending_local_save: None,
+            headless: false,
+            live_view_was_on: false,
             save_dest_folder: String::new(),
             save_pick_rx: None,
             save_status: None,
@@ -1534,7 +1546,9 @@ impl AppWindow {
             ui.label(egui::RichText::new("Preview").font(egui::FontId::proportional(14.0)));
             ui.separator();
             let Some(tex) = self.preview_texture.clone() else {
-                ui.label(if self.live_view.is_some() {
+                ui.label(if matches!(self.model.status, RecordingStatus::Recording) {
+                    "Waiting for the first frame from the recording…"
+                } else if self.live_view.is_some() {
                     "Starting live view…"
                 } else {
                     "No preview available"
@@ -1739,6 +1753,7 @@ impl AppWindow {
         // The recording pipeline opens its own capture session and feeds the same
         // preview channel. Two portal sessions at once is asking for trouble, so the
         // idle live view stands down first.
+        self.live_view_was_on = self.live_view.is_some();
         self.stop_live_view();
         self.cancel_pick("recording started");
 
@@ -2113,6 +2128,15 @@ impl AppWindow {
         };
         self.finalize_rx = None;
         self.model.status = RecordingStatus::Idle;
+
+        // Put the live view back if the operator had it on before recording. It has to
+        // stand down while recording so only one ScreenCast session is ever open, but
+        // it used to stay gone afterwards, so turning it on was undone by every take.
+        // Status is Idle by this point, which `start_live_view` requires.
+        if std::mem::take(&mut self.live_view_was_on) {
+            self.start_live_view();
+        }
+
         // Come back so the operator can see the outcome and the save prompt.
         self.pending_window_cmd = Some(false);
 
@@ -2245,6 +2269,18 @@ impl AppWindow {
         // Dropped when the task returns by any path, so a live view that failed to
         // start can never make `stop_live_view` wait.
         let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
+
+        if self.headless {
+            // A portal ScreenCast session reaches outside the process — it prompts the
+            // real desktop and holds a real grant — exactly like the tray and the global
+            // hotkeys `new_headless` already declines to build. Record the state so the
+            // surrounding logic stays testable, but do not open a session. Dropping
+            // `finished_tx` here means `stop_live_view` sees Disconnected and returns at
+            // once rather than waiting out its timeout.
+            self.live_view = Some(LiveView { stop: stop_tx, error, finished: finished_rx });
+            self.model.diagnostics.push("Live view started.");
+            return;
+        }
 
         self.tokio_handle.spawn(async move {
             // The trait must be in scope for initialize/capture_frame/shutdown.
@@ -2413,7 +2449,19 @@ impl AppWindow {
                 // rather than buried elsewhere. It runs a capture session, so it is off
                 // unless asked for, and never while recording (which feeds the preview
                 // from its own session).
-                if !matches!(self.model.status, RecordingStatus::Recording) {
+                if matches!(self.model.status, RecordingStatus::Recording) {
+                    // The preview keeps running during a recording — fed by the
+                    // recording's own capture session rather than a second one — so the
+                    // control stays put, checked and disabled. Hiding it outright read
+                    // as the feature disappearing the moment BSR auto-minimised.
+                    let mut live = true;
+                    ui.add_enabled(false, egui::Checkbox::new(&mut live, "Live view"))
+                        .on_disabled_hover_text(
+                            "While recording, the preview comes from the recording itself, \
+                             so it cannot be switched off here. It returns to an idle live \
+                             view when you stop.",
+                        );
+                } else {
                     let mut live = self.live_view.is_some();
                     if ui.checkbox(&mut live, "Live view")
                         .on_hover_text("Show the screen in the Preview pane so corners can be clicked on it.")

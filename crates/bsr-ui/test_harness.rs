@@ -593,6 +593,73 @@ mod disabled_reason_tests {
 mod window_tests {
     use super::UiHarness;
 
+    /// The "Live view" control used to be hidden outright while recording, so the
+    /// instant BSR auto-minimised for a take the operator saw the checkbox vanish and
+    /// read the preview as gone. The preview does keep running during a recording — it
+    /// is fed by the recording's own capture session — so the control must stay put.
+    #[test]
+    fn the_live_view_control_stays_visible_while_recording() {
+        let mut h = UiHarness::new();
+        h.frames(2);
+        assert!(
+            h.find("Live view").is_some(),
+            "the Live view control must be present when idle"
+        );
+
+        h.app.model.status = crate::RecordingStatus::Recording;
+        h.frames(2);
+        assert!(
+            h.find("Live view").is_some(),
+            "the Live view control disappeared while recording; it must stay visible \
+             (disabled) so auto-minimising does not read as the preview being gone"
+        );
+    }
+
+    /// While recording, an empty preview pane must say what it is waiting for rather
+    /// than claim there is none to be had.
+    #[test]
+    fn an_empty_preview_says_what_it_is_waiting_for() {
+        let mut h = UiHarness::new();
+        h.frames(2);
+        assert!(h.find("No preview available").is_some());
+
+        h.app.model.status = crate::RecordingStatus::Recording;
+        h.frames(2);
+        assert!(
+            h.find("Waiting for the first frame from the recording…").is_some(),
+            "while recording, an empty preview must not claim \"No preview available\""
+        );
+    }
+
+    /// An operator who turned the live view on should still have it after a take.
+    #[test]
+    fn the_live_view_is_restored_after_a_recording_finishes() {
+        let mut h = UiHarness::new();
+        h.frames(1);
+
+        // The state on_record_pressed records before standing the live view down.
+        h.app.live_view_was_on = true;
+        h.app.model.status = crate::RecordingStatus::Recording;
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        h.app.finalize_rx = Some(rx);
+        tx.send(Ok(())).unwrap();
+
+        h.app.poll_finalize();
+
+        assert!(
+            !h.app.live_view_was_on,
+            "the restore flag must be consumed, not left set for the next take"
+        );
+        // start_live_view spawns a real capture backend, so assert the intent was acted
+        // on rather than requiring a portal session in a unit test.
+        assert!(
+            h.app.model.diagnostics.lines.iter().any(|l| l.contains("Live view started")),
+            "the live view must be restarted after a recording finishes; diagnostics were {:?}",
+            h.app.model.diagnostics.lines
+        );
+    }
+
     fn minimised(h: &UiHarness) -> Option<bool> {
         h.commands.iter().find_map(|c| match c {
             egui::ViewportCommand::Minimized(v) => Some(*v),
