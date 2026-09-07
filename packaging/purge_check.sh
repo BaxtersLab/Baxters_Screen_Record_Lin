@@ -54,6 +54,11 @@ after)
     leaked=0
     shared=0
     while IFS= read -r p; do
+        # `dpkg -L` lists the archive's `./` entry as `/.` — the filesystem root, which
+        # no package owns and which obviously survives. Counting it as a leak turned a
+        # clean purge into a false RED, which is worse than no gate: it trains you to
+        # ignore the result.
+        case "$p" in /.|/) continue ;; esac
         [ -e "$p" ] || continue
         if owner=$(dpkg -S "$p" 2>/dev/null); then
             # Still owned by someone else — legitimately shared.
