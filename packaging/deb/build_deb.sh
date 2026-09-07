@@ -59,6 +59,33 @@ find "$STAGE/usr/share/icons" -type f -exec chmod 0644 {} +
 
 INSTALLED_KB=$(du -sk "$STAGE" | cut -f1)
 
+# ── Depends ──────────────────────────────────────────────────────────────────
+#
+# The linked-library half is DERIVED from the binary at build time. It used to be a
+# hardcoded list, snapshotted once from a running process, and it drifted: dropping
+# tray-icon's `libxdo` feature removed libxdo.so.3 from the binary while the package
+# went on declaring `libxdo3`. A frozen list can also UNDER-declare, which is the
+# failure that actually hurts — the package installs and then the app will not start.
+SHLIB_TMP="$(mktemp -d)"
+mkdir -p "$SHLIB_TMP/debian"
+printf 'Source: %s\n\nPackage: %s\nArchitecture: %s\n' "$PKG" "$PKG" "$ARCH" \
+    > "$SHLIB_TMP/debian/control"
+SHLIB_DEPS="$(cd "$SHLIB_TMP" && dpkg-shlibdeps -O --ignore-missing-info "$BIN" 2>/dev/null \
+    | sed 's/^shlibs:Depends=//')"
+rm -rf "$SHLIB_TMP"
+if [ -z "$SHLIB_DEPS" ]; then
+    echo "build_deb: dpkg-shlibdeps produced no dependencies for $BIN" >&2
+    exit 1
+fi
+
+# The other half CANNOT be derived, and each entry states why. `ldd` and
+# `dpkg-shlibdeps` see only what the linker recorded; these are opened at run time
+# (dlopen) or are services and plugins with no ELF link at all. Measured by reading
+# /proc/<pid>/maps of a running BSR, which is the only way to catch them.
+RUNTIME_DEPS="gstreamer1.0-pipewire, gstreamer1.0-plugins-base, xdg-desktop-portal,
+ libayatana-appindicator3-1, libegl1, libwayland-client0, libwayland-egl1,
+ libwayland-cursor0, libxkbcommon0, libx11-6"
+
 cat > "$STAGE/DEBIAN/control" <<CONTROL
 Package: $PKG
 Version: $VERSION
@@ -67,15 +94,7 @@ Priority: optional
 Architecture: $ARCH
 Maintainer: Baxter <165230507+BaxtersLab@users.noreply.github.com>
 Installed-Size: $INSTALLED_KB
-Depends: libavcodec62 (>= 7:8.0.1), libavformat62 (>= 7:8.0.1), libavutil60 (>= 7:8.0.1),
- libc6 (>= 2.43), libgcc-s1 (>= 4.2), libgdk-pixbuf-2.0-0 (>= 2.22.0),
- libglib2.0-0t64 (>= 2.54.0), libgstreamer-plugins-base1.0-0 (>= 1.10.0),
- libgstreamer1.0-0 (>= 1.0.0), libgtk-3-0t64 (>= 3.21.5), libswscale9 (>= 7:8.0.1),
- libxdo3 (>= 1:3.20130104.1),
- gstreamer1.0-pipewire, gstreamer1.0-plugins-base,
- xdg-desktop-portal,
- libayatana-appindicator3-1, libegl1, libwayland-client0, libwayland-egl1,
- libwayland-cursor0, libxkbcommon0, libx11-6
+Depends: $SHLIB_DEPS, $RUNTIME_DEPS
 Recommends: xdg-desktop-portal-gnome
 Description: Baxter's Screen Record - screen recorder with a croppable record space
  Records the screen to H.264/MP4 through the XDG desktop portal and PipeWire, which is

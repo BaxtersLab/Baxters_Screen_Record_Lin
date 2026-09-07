@@ -27,7 +27,15 @@ chrono = { workspace = true }
 
 eframe = "0.27"
 egui = "0.27"
-tray-icon = "0.13"
+# `default-features = false` drops tray-icon's ONLY default feature, `libxdo`, which
+# forwards to `muda/libxdo`. muda uses it in exactly one place — synthesising Ctrl+C /
+# Ctrl+V keystrokes into the focused window so its *predefined* Copy/Cut/Paste/SelectAll
+# menu items work. BSR's tray has four custom items (Open, Start, Stop, Exit) and no
+# predefined item, so that code path was unreachable, yet the binary still imported
+# `xdo_send_keysequence_window`. A screen recorder has no business linking an
+# input-injection function it cannot call. Also removes `libxdo3` from the package's
+# runtime dependencies.
+tray-icon = { version = "0.13", default-features = false }
 global-hotkey = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 glob = "0.3"
