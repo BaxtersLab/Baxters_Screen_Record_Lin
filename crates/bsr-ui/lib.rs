@@ -738,6 +738,12 @@ pub fn preview_click_to_screen(
 struct LiveView {
     stop: tokio::sync::mpsc::Sender<()>,
     error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Signalled once the live view's portal session is actually closed.
+    ///
+    /// Stopping the live view has to *complete* before a recording session is
+    /// created. Two concurrent ScreenCast sessions do not work: the second one
+    /// finishes its handshake and then never delivers a frame.
+    finished: std::sync::mpsc::Receiver<()>,
 }
 
 /// Turn a portal `file://` URI into a local path.
@@ -1989,8 +1995,17 @@ impl AppWindow {
         });
 
         // Spawn pipeline services
+        //
+        // A capture failure used to go to `tracing::error!` and nowhere else, so the
+        // one thing that could stop a recording dead — the capture service refusing to
+        // start — was invisible to the operator. It reached the journal, which nobody
+        // reads mid-recording, while the UI carried on saying "Recording started."
+        let capture_err_telem = self.telemetry_tx.clone();
         self.tokio_handle.spawn(async move {
             if let Err(e) = capture_service.run().await {
+                let _ = capture_err_telem.send(bsr_ipc::TelemetryEvent::ErrorOccurred {
+                    message: format!("Capture stopped: {e}"),
+                });
                 tracing::error!("Capture error: {}", e);
             }
         });
@@ -2227,6 +2242,9 @@ impl AppWindow {
         let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
         let error = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
         let task_error = error.clone();
+        // Dropped when the task returns by any path, so a live view that failed to
+        // start can never make `stop_live_view` wait.
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
 
         self.tokio_handle.spawn(async move {
             // The trait must be in scope for initialize/capture_frame/shutdown.
@@ -2263,19 +2281,47 @@ impl AppWindow {
                     }
                 }
             }
+            // Drops the portal connection, which joins its D-Bus thread and closes
+            // the session. Only after this is the screen-share genuinely released.
             let _ = backend.shutdown().await;
+            let _ = finished_tx.send(());
         });
 
-        self.live_view = Some(LiveView { stop: stop_tx, error });
+        self.live_view = Some(LiveView { stop: stop_tx, error, finished: finished_rx });
         self.model.diagnostics.push("Live view started.");
     }
 
+    /// Stop the idle live view and **wait for its portal session to close**.
+    ///
+    /// This used to spawn the stop signal and return immediately, so
+    /// `on_record_pressed` went straight on to build the recording's capture service
+    /// while the live view still held a ScreenCast session. Two concurrent sessions
+    /// do not work: the recording's handshake completed and its stream then delivered
+    /// nothing at all, for the entire length of the recording, with no error anywhere.
+    /// The operator got a 261-byte MP4 with an empty `mdat`.
+    ///
+    /// Measured in the journal on 2026-09-07: the recording's capture service started
+    /// at 02:25:35.592 and the live view's backend shut down at 02:25:35.673 — the new
+    /// session was negotiated 81 ms inside the old one's lifetime.
     fn stop_live_view(&mut self) {
         if let Some(live) = self.live_view.take() {
-            let stop = live.stop.clone();
-            self.tokio_handle.spawn(async move {
-                let _ = stop.send(()).await;
-            });
+            // `try_send` is the right call here, not `send().await` or `blocking_send`:
+            // this runs on the tokio main thread inside eframe's blocking event loop,
+            // where entering the runtime again panics. The channel has capacity 1 and
+            // this is a one-shot signal.
+            let _ = live.stop.try_send(());
+
+            const TEARDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+            match live.finished.recv_timeout(TEARDOWN_WAIT) {
+                // Disconnected means the task already returned — equally done.
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.model.diagnostics.push(
+                        "Live view did not release the screen-share session within 5s —                          a recording started now may receive no frames.",
+                    );
+                }
+            }
+
             self.preview_rx = None;
             self.preview_texture = None;
             self.model.diagnostics.push("Live view stopped.");
@@ -3320,5 +3366,79 @@ mod tests {
     }
 
 
+
+
+    /// Starting a recording must not negotiate a second ScreenCast session while the
+    /// idle live view still holds one. `stop_live_view` used to spawn its stop signal
+    /// and return at once, so `on_record_pressed` built the recording pipeline inside
+    /// the old session's lifetime; the recording's stream then delivered no frames for
+    /// its whole duration and the operator got a 261-byte MP4 with an empty `mdat`.
+    #[test]
+    fn stopping_the_live_view_waits_for_the_portal_session_to_close() {
+        let ctx = egui::Context::default();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = AppWindow::new_headless(&ctx, BsrConfig::default(), rt.handle().clone(), None);
+
+        let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
+
+        // Stand in for the live-view task: on stop, take a measurable moment to tear
+        // the portal session down, exactly as dropping the D-Bus connection does.
+        rt.spawn(async move {
+            let _ = stop_rx.recv().await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = finished_tx.send(());
+        });
+
+        app.live_view = Some(LiveView {
+            stop: stop_tx,
+            error: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            finished: finished_rx,
+        });
+
+        let started = std::time::Instant::now();
+        app.stop_live_view();
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(250),
+            "stop_live_view returned after {waited:?}, before the live view released \
+             its portal session. The recording's session would then be negotiated \
+             alongside it and receive no frames."
+        );
+        assert!(app.live_view.is_none(), "the live view must be cleared");
+    }
+
+    /// A live view that never signals must not wedge the UI thread forever.
+    #[test]
+    fn stopping_a_wedged_live_view_gives_up_and_says_so() {
+        let ctx = egui::Context::default();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = AppWindow::new_headless(&ctx, BsrConfig::default(), rt.handle().clone(), None);
+
+        // Sender held alive, never signalled: the task is wedged, not gone.
+        let (stop_tx, _stop_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
+
+        app.live_view = Some(LiveView {
+            stop: stop_tx,
+            error: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            finished: finished_rx,
+        });
+
+        let started = std::time::Instant::now();
+        app.stop_live_view();
+        let waited = started.elapsed();
+        drop(finished_tx);
+
+        assert!(
+            waited < std::time::Duration::from_secs(8),
+            "stop_live_view blocked for {waited:?}; it must give up and report"
+        );
+        assert!(
+            app.model.diagnostics.lines.iter().any(|l| l.contains("did not release")),
+            "a teardown that timed out must be reported, not silently ignored"
+        );
+    }
 
 }

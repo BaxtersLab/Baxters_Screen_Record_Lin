@@ -46,7 +46,14 @@ use tracing::{info, warn};
 /// How long to wait for the very first frame before declaring the backend unusable.
 /// Generous: it covers the portal dialog being approved on a first run, format
 /// negotiation, and a desktop that is not repainting.
-const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `initialize` waits for the stream to prove itself with a first frame.
+///
+/// A live ScreenCast stream delivers its first buffer in well under a second. This was
+/// 30 s, which is far too long to sit silent after the operator presses Record: in the
+/// field a recording whose stream never produced anything simply looked like it was
+/// recording for 13 s and then wrote an empty file, because the operator stopped long
+/// before the timeout could fire and say what was wrong.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Bound on how many queued buffers one `capture_frame` will drain to reach the newest.
 const MAX_DRAIN: usize = 30;
@@ -71,6 +78,9 @@ struct PortalStream {
 struct PortalConnection {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
+    /// Signalled by the portal thread just before it returns, so `drop` can wait a
+    /// bounded time instead of joining forever.
+    exited: std::sync::Mutex<mpsc::Receiver<()>>,
 }
 
 impl Drop for PortalConnection {
@@ -79,7 +89,29 @@ impl Drop for PortalConnection {
             let _ = tx.send(());
         }
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            // A plain `join()` here is unbounded, and this runs inside an async task:
+            // it blocks a tokio worker thread and `tokio::time::timeout` cannot cancel
+            // it, because the blocking call happens inside the future's poll. Measured
+            // on this box: shutting a backend down could sit in this join for over
+            // 150 s. Wait a bounded time, then detach — a leaked parked thread is a far
+            // smaller problem than an application that never returns from Stop.
+            let waited = self
+                .exited
+                .get_mut()
+                .map(|rx| rx.recv_timeout(Duration::from_secs(3)))
+                .unwrap_or(Ok(()));
+            match waited {
+                Ok(()) => {
+                    let _ = t.join();
+                }
+                Err(_) => {
+                    warn!(
+                        "portal D-Bus thread did not exit within 3s; detaching it rather \
+                         than blocking. The session will close when the process does."
+                    );
+                    drop(t); // detach
+                }
+            }
         }
     }
 }
@@ -448,10 +480,20 @@ fn cursor_mode() -> ashpd::desktop::screencast::CursorMode {
 fn start_portal_session() -> Result<(PortalStream, PortalConnection), String> {
     let (ready_tx, ready_rx) = mpsc::channel::<Result<PortalStream, String>>();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // Sent on every exit path (including panics, via the guard's Drop), so a dropped
+    // PortalConnection never waits on a thread that is already gone.
+    let (exited_tx, exited_rx) = mpsc::channel::<()>();
 
     let thread = std::thread::Builder::new()
         .name("bsr-portal".into())
         .spawn(move || {
+            struct ExitSignal(mpsc::Sender<()>);
+            impl Drop for ExitSignal {
+                fn drop(&mut self) {
+                    let _ = self.0.send(());
+                }
+            }
+            let _exit = ExitSignal(exited_tx);
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -469,7 +511,17 @@ fn start_portal_session() -> Result<(PortalStream, PortalConnection), String> {
                         // Park here holding the connection open. The portal tears the
                         // session down the instant this thread's zbus connection goes away.
                         let _ = shutdown_rx.await;
-                        let _ = session.close().await;
+                        // `close()` can never return — measured on this box, it left the
+                        // thread parked indefinitely, so the caller's join blocked forever
+                        // AND the portal never learned the session was finished. GNOME then
+                        // still considered the cast active, and the next session BSR opened
+                        // was granted but delivered no frames at all. Bound it: the session
+                        // is released either way when this thread's zbus connection drops.
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            session.close(),
+                        )
+                        .await;
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -491,7 +543,14 @@ fn start_portal_session() -> Result<(PortalStream, PortalConnection), String> {
         }
     };
 
-    Ok((stream, PortalConnection { shutdown: Some(shutdown_tx), thread: Some(thread) }))
+    Ok((
+        stream,
+        PortalConnection {
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+            exited: std::sync::Mutex::new(exited_rx),
+        },
+    ))
 }
 
 async fn handshake() -> Result<
