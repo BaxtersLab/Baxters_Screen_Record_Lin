@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // build.rs — generates a multi-resolution .ico from the BSR splash PNG and
 // embeds it into the Windows .exe via winresource.
 

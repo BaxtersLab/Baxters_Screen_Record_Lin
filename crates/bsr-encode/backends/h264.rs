@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::{EncoderConfig, EncoderError, EncodedPacket};
 use ffmpeg_next as ffmpeg;
 use std::time::Instant;

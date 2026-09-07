@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::{MuxerBackend, MuxerError, MuxerResult, EncodedPacket};
 use bsr_ipc::FileNamingStrategy;
 use ffmpeg_next as ffmpeg;

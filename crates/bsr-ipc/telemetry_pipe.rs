@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};

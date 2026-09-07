@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use anyhow::Context;
 use named_pipe::PipeOptions;
 use serde_json::Value;

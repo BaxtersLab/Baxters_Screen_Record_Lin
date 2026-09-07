@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, Notify};
 use bsr_core::buffer::DropOldestBuffer;

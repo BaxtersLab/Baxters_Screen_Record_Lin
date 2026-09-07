@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
 

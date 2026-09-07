@@ -213,11 +213,58 @@ pub struct OutputConfig {
     pub max_duration_hours: u32,
 }
 
+/// The user's home directory, on either platform.
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Is this path unusable on the platform we are actually running on?
+///
+/// A configuration file written on Windows — or a stale default like
+/// `C:\Users\Default\Videos\BSR Recordings` — is not merely wrong on Linux, it is
+/// actively dangerous: FFmpeg reads the leading `C:` as a protocol scheme and fails with
+/// "Protocol not found", after the recording has already been made.
+pub fn is_foreign_path(path: &str) -> bool {
+    if path.trim().is_empty() {
+        return true;
+    }
+    #[cfg(not(windows))]
+    {
+        let b = path.as_bytes();
+        // A drive letter, e.g. `C:\...` or `C:/...`
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return true;
+        }
+        // A UNC path, or any path using backslash separators.
+        if path.starts_with("\\\\") || path.contains('\\') {
+            return true;
+        }
+    }
+    #[cfg(windows)]
+    {
+        // A POSIX absolute path is not usable on Windows.
+        if path.starts_with('/') {
+            return true;
+        }
+    }
+    false
+}
+
 impl Default for OutputConfig {
     fn default() -> Self {
-        // Use environment variables for cross-platform compatibility
-        let user_docs = env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Default".to_string());
-        let output_folder = format!("{}\\Videos\\BSR Recordings", user_docs);
+        // The comment here used to claim "cross-platform compatibility" while doing the
+        // opposite: it read USERPROFILE (Windows-only, unset on Linux) and fell back to
+        // the literal `C:\Users\Default`, joined with backslashes. On Linux that produced
+        // `C:\Users\Default\Videos\BSR Recordings`, and FFmpeg parses the leading `C:` as
+        // a URL scheme — a recording died with "Protocol not found" on a clean install.
+        // Article XI: derive from one root and join portably, never a drive letter.
+        let output_folder = home_dir()
+            .map(|h| h.join("Videos").join("BSR Recordings"))
+            .unwrap_or_else(|| env::temp_dir().join("BSR Recordings"))
+            .to_string_lossy()
+            .into_owned();
 
         Self {
             output_folder,
@@ -363,8 +410,32 @@ pub enum ConfigError {
 pub fn load_config(path: &PathBuf) -> Result<BsrConfig, ConfigError> {
     let data = std::fs::read_to_string(path)
         .map_err(|e| ConfigError::Load(e.to_string()))?;
-    toml::from_str(&data)
-        .map_err(|e| ConfigError::Load(e.to_string()))
+    let mut config: BsrConfig =
+        toml::from_str(&data).map_err(|e| ConfigError::Load(e.to_string()))?;
+    config.repair_for_this_platform();
+    Ok(config)
+}
+
+impl BsrConfig {
+    /// Replace settings a config file carries that cannot work on this platform.
+    ///
+    /// Config files travel: this project was ported from Windows and its committed
+    /// `bsr-config.toml` still holds `C:\Users\Default\Videos\BSR Recordings`. Reading
+    /// that on Linux does not fail at load — it fails *after* a recording has been made,
+    /// deep inside FFmpeg, as "Protocol not found", because `C:` parses as a URL scheme.
+    /// Repairing at load turns a lost take into a log line.
+    pub fn repair_for_this_platform(&mut self) -> Vec<String> {
+        let mut repaired = Vec::new();
+        if is_foreign_path(&self.output.output_folder) {
+            let fallback = OutputConfig::default().output_folder;
+            repaired.push(format!(
+                "output folder {:?} is not usable on this platform; using {:?}",
+                self.output.output_folder, fallback
+            ));
+            self.output.output_folder = fallback;
+        }
+        repaired
+    }
 }
 
 pub fn load_config_from_default_path() -> Result<BsrConfig, ConfigError> {
@@ -443,3 +514,82 @@ pub fn validate_config(config: &BsrConfig) -> Vec<ConfigError> {
 #[cfg(test)]
 #[path = "config_test.rs"]
 mod config_test;
+
+#[cfg(test)]
+mod platform_path_tests {
+    use super::*;
+
+    /// **The bug a clean package install found.** `OutputConfig::default()` read
+    /// `USERPROFILE` — Windows-only — and fell back to the literal `C:\Users\Default`,
+    /// joined with backslashes. On Linux that is not a path at all, and FFmpeg parses the
+    /// leading `C:` as a URL scheme: a recording completed and then died in the muxer with
+    /// "Protocol not found", losing the take.
+    #[test]
+    fn the_default_output_folder_is_usable_on_this_platform() {
+        let folder = OutputConfig::default().output_folder;
+        assert!(!folder.is_empty());
+        assert!(
+            !is_foreign_path(&folder),
+            "the default output folder is not usable here: {folder:?}"
+        );
+        assert!(
+            std::path::Path::new(&folder).is_absolute(),
+            "must be absolute, got {folder:?}"
+        );
+        #[cfg(not(windows))]
+        {
+            assert!(!folder.contains('\\'), "no backslash separators on unix: {folder:?}");
+            assert!(!folder.contains(':'), "no drive letter on unix: {folder:?}");
+        }
+    }
+
+    #[test]
+    fn windows_paths_are_recognised_as_foreign_on_unix() {
+        #[cfg(not(windows))]
+        {
+            for p in [
+                "C:\\Users\\Default\\Videos\\BSR Recordings",
+                "D:/Videos",
+                "\\\\server\\share\\clips",
+                "Videos\\BSR",
+            ] {
+                assert!(is_foreign_path(p), "{p:?} should be foreign here");
+            }
+            for p in ["/home/someone/Videos", "/tmp/x", "/var/tmp/BSR Recordings"] {
+                assert!(!is_foreign_path(p), "{p:?} is a perfectly good unix path");
+            }
+        }
+        assert!(is_foreign_path(""), "an empty path is unusable everywhere");
+        assert!(is_foreign_path("   "), "and so is whitespace");
+    }
+
+    /// A config file carrying the Windows path must be repaired at load, not honoured.
+    /// This project's own committed `bsr-config.toml` still contains exactly that value.
+    #[test]
+    fn a_config_with_a_windows_path_is_repaired_on_load() {
+        let mut config = BsrConfig::default();
+        config.output.output_folder = "C:\\Users\\Default\\Videos\\BSR Recordings".to_string();
+
+        let notes = config.repair_for_this_platform();
+
+        #[cfg(not(windows))]
+        {
+            assert_eq!(notes.len(), 1, "the repair must be reported, not silent");
+            assert!(notes[0].contains("not usable"), "got: {}", notes[0]);
+            assert!(
+                !is_foreign_path(&config.output.output_folder),
+                "still unusable after repair: {:?}",
+                config.output.output_folder
+            );
+        }
+    }
+
+    /// A good config must be left completely alone.
+    #[test]
+    fn a_usable_config_is_not_touched() {
+        let mut config = BsrConfig::default();
+        let before = config.output.output_folder.clone();
+        assert!(config.repair_for_this_platform().is_empty(), "nothing to repair");
+        assert_eq!(config.output.output_folder, before);
+    }
+}
