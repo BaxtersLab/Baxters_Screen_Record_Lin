@@ -24,6 +24,10 @@ path = "../../tests/record_space.rs"
 name = "pipeline_e2e"
 path = "../../tests/pipeline_e2e.rs"
 
+[[test]]
+name = "preview_isolation"
+path = "../../tests/preview_isolation.rs"
+
 [dev-dependencies]
 bsr-core = { path = "../bsr-core" }
 bsr-ipc = { path = "../bsr-ipc" }
@@ -37,3 +41,4 @@ serde_json = { workspace = true }
 # libavfilter, whose dev headers are deliberately not installed on this box.
 ffmpeg-next = { version = "8", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
 tempfile = "3"
+async-trait = "0.1"

@@ -124,6 +124,55 @@ pub fn encoder_config_for(
     }
 }
 
+
+/// Does a finalised recording actually contain video data?
+///
+/// The muxer can finalise a perfectly valid MP4 that holds nothing. If no packets
+/// ever reach it, `write_header` + `write_trailer` still succeed and produce a
+/// container with an empty (8-byte) `mdat` and no track at all. That reached an
+/// operator: a 17 s recording wrote 261 bytes while the UI reported "Recording
+/// finalised and ready to save", because the muxer's `Ok(())` describes the
+/// *operation*, not the *artifact*.
+///
+/// Returns true only on a positive identification of an empty recording. Anything
+/// unparseable is left alone — a file that cannot be walked here may still be
+/// perfectly good, and a false alarm about a real recording is its own harm.
+pub fn recording_is_empty(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+
+    // Walk top-level atoms: [u32 size][4-byte type]. A size of 8 for `mdat` means
+    // the box holds no payload, i.e. not a single sample was written.
+    let mut offset: u64 = 0;
+    let mut saw_mdat = false;
+    loop {
+        let mut header = [0u8; 8];
+        if std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(offset)).is_err() {
+            break;
+        }
+        if f.read_exact(&mut header).is_err() {
+            break;
+        }
+        let size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+        let kind = &header[4..8];
+        if kind == b"mdat" {
+            saw_mdat = true;
+            if size == 8 {
+                return true;
+            }
+        }
+        // 0 means "to end of file"; 1 means a 64-bit size follows. Neither is an
+        // empty mdat, and following them adds parsing this does not need.
+        if size < 8 {
+            break;
+        }
+        offset += size;
+    }
+    // A container with no mdat at all and nothing else to say is also not a
+    // recording, but only claim that when the file is implausibly small.
+    !saw_mdat && std::fs::metadata(path).map(|m| m.len() < 1024).unwrap_or(false)
+}
+
 /// Where recordings go by default.
 ///
 /// This was the literal `C:\Users\Public\Videos\BSR`, which on Linux is not a path at
@@ -1727,6 +1776,15 @@ impl AppWindow {
                 rec_w, rec_h, r.x1, r.y1, r.x2, r.y2
             ));
         }
+        // The live preview gets its own copy of each frame from the capture service.
+        // It must NOT share `frame_buf`: that buffer belongs to the encoder, and a
+        // second consumer popping from it removes frames from the recording. When the
+        // preview did share it, the two tasks were woken by one `notify_one()` — which
+        // wakes a single waiter — so the preview swallowed roughly half the frames, and
+        // once the encoder drained per wake the preview could starve it outright,
+        // producing an empty 261-byte file that still reported success.
+        let (frame_preview_tx, frame_preview_rx) =
+            tokio::sync::watch::channel::<Option<CaptureFrame>>(None);
         let capture_service = bsr_capture::CaptureService::new(
             bsr_capture::platform_backend(),
             capture_config,
@@ -1734,7 +1792,8 @@ impl AppWindow {
             cap_shutdown_rx,
             frame_buf.clone(),
             frame_notify.clone(),
-        );
+        )
+        .with_preview(frame_preview_tx, std::time::Duration::from_millis(200));
 
         // Create encoder service with H.264 backend, sized to the cropped frame.
         let encoder_config = encoder_config_for(&self.model.settings, rec_w, rec_h);
@@ -1824,32 +1883,20 @@ impl AppWindow {
             bsr_ipc::telemetry_pipe::telemetry_client(frame_rx, pipe_path_clone).await;
         });
 
-        // Preview channel: background task will drain the shared frame_buf,
-        // keep only the latest frame and send a resized RGBA preview to the UI.
+        // Preview channel: the background task scales the capture service's own
+        // preview copy and sends RGBA to the UI. It never touches `frame_buf`.
         let (preview_tx, preview_rx) = mpsc::unbounded_channel::<PreviewImage>();
         // store receiver so UI can poll it
         self.preview_rx = Some(preview_rx);
 
-        // Spawn preview drain task
-        let frame_buf_for_preview = frame_buf.clone();
-        let frame_notify_for_preview = frame_notify.clone();
+        let mut frame_preview_rx = frame_preview_rx;
         let preview_task_handle = self.tokio_handle.spawn(async move {
             loop {
-                frame_notify_for_preview.notified().await;
-
-                // Drain everything and keep only the latest frame
-                let mut latest: Option<CaptureFrame> = None;
-                loop {
-                    let popped = {
-                        let mut buf = frame_buf_for_preview.lock().unwrap();
-                        buf.pop()
-                    };
-                    if let Some(f) = popped {
-                        latest = Some(f);
-                    } else {
-                        break;
-                    }
+                // Ends when the capture service drops its sender.
+                if frame_preview_rx.changed().await.is_err() {
+                    break;
                 }
+                let latest = frame_preview_rx.borrow_and_update().clone();
 
                 if let Some(f) = latest {
                     // Convert BGRA -> RGBA
@@ -2055,7 +2102,21 @@ impl AppWindow {
         self.pending_window_cmd = Some(false);
 
         match &outcome {
-            Ok(()) => self.model.diagnostics.push("Recording finalised and ready to save."),
+            Ok(()) => {
+                // The muxer's Ok describes the operation, not the artifact.
+                let empty = self
+                    .current_recording_path
+                    .as_deref()
+                    .map_or(false, recording_is_empty);
+                if empty {
+                    self.model.diagnostics.push(
+                        "Finalising produced an EMPTY recording — no video data reached \
+                         the muxer. The file is not usable.",
+                    );
+                } else {
+                    self.model.diagnostics.push("Recording finalised and ready to save.");
+                }
+            }
             Err(e) => self.model.diagnostics.push(format!(
                 "Finalising failed ({e}) — the file may be incomplete or unplayable."
             )),
@@ -3200,5 +3261,64 @@ mod tests {
             );
         }
     }
+
+
+    /// Build an MP4 skeleton with an `mdat` of the given payload length.
+    fn mp4_skeleton(mdat_payload: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&32u32.to_be_bytes());
+        b.extend_from_slice(b"ftyp");
+        b.extend_from_slice(b"isomiso2avc1mp41");
+        b.extend_from_slice(&[0u8; 8]);
+        b.extend_from_slice(&8u32.to_be_bytes());
+        b.extend_from_slice(b"free");
+        b.extend_from_slice(&((8 + mdat_payload) as u32).to_be_bytes());
+        b.extend_from_slice(b"mdat");
+        b.extend_from_slice(&vec![0xABu8; mdat_payload]);
+        b.extend_from_slice(&16u32.to_be_bytes());
+        b.extend_from_slice(b"moov");
+        b.extend_from_slice(&[0u8; 8]);
+        b
+    }
+
+    /// The exact shape the muxer wrote in the field: a valid MP4 whose `mdat` is
+    /// empty because no packet ever reached it. The operator was told this was
+    /// "finalised and ready to save".
+    #[test]
+    fn an_empty_recording_is_identified() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("empty.mp4");
+        std::fs::write(&p, mp4_skeleton(0)).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 64);
+        assert!(
+            recording_is_empty(&p),
+            "an mdat with no payload is an empty recording"
+        );
+    }
+
+    #[test]
+    fn a_recording_with_video_data_is_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("real.mp4");
+        std::fs::write(&p, mp4_skeleton(200_000)).unwrap();
+        assert!(
+            !recording_is_empty(&p),
+            "a recording with real payload must never be reported as empty"
+        );
+    }
+
+    /// A false alarm about a good recording is its own harm, so anything that
+    /// cannot be positively identified as empty is left alone.
+    #[test]
+    fn unreadable_or_unparseable_files_are_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!recording_is_empty(&dir.path().join("does-not-exist.mp4")));
+
+        let junk = dir.path().join("junk.bin");
+        std::fs::write(&junk, vec![0x42u8; 500_000]).unwrap();
+        assert!(!recording_is_empty(&junk));
+    }
+
+
 
 }

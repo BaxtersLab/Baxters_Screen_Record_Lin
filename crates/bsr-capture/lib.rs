@@ -34,7 +34,7 @@ use bsr_core::buffer::DropOldestBuffer;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tracing::{info, warn};
 use bsr_ipc::TelemetryEvent;
 
@@ -197,6 +197,12 @@ pub struct CaptureService<B: CaptureBackend> {
     shutdown_rx: mpsc::Receiver<()>,
     frame_buf: Arc<Mutex<DropOldestBuffer<CaptureFrame>>>,
     frame_notify: Arc<Notify>,
+    /// Optional live-preview sink and the minimum interval between sends.
+    ///
+    /// The preview gets its **own** copy of each frame. It must never pop from
+    /// `frame_buf`: that buffer belongs to the encoder, and a second consumer on
+    /// it removes frames from the recording itself.
+    preview: Option<(watch::Sender<Option<CaptureFrame>>, Duration)>,
 }
 
 impl<B: CaptureBackend> CaptureService<B> {
@@ -220,13 +226,32 @@ impl<B: CaptureBackend> CaptureService<B> {
             shutdown_rx,
             frame_buf,
             frame_notify,
+            preview: None,
         }
+    }
+
+    /// Send a copy of each captured frame to a live preview, at most once per
+    /// `min_interval`.
+    ///
+    /// A preview must never share the encoder's ring buffer. When it did, the
+    /// preview task and the encoder service were two consumers woken by one
+    /// `notify_one()` — which wakes exactly one waiter — and every frame the
+    /// preview won was discarded after being scaled for display. The recording
+    /// lost those frames outright.
+    pub fn with_preview(
+        mut self,
+        tx: watch::Sender<Option<CaptureFrame>>,
+        min_interval: Duration,
+    ) -> Self {
+        self.preview = Some((tx, min_interval));
+        self
     }
 
     pub async fn run(mut self) -> Result<(), CaptureError> {
         info!("Capture service starting");
         self.backend.initialize().await?;
 
+        let mut last_preview: Option<std::time::Instant> = None;
         let frame_interval = Duration::from_secs_f64(1.0 / self.config.fps as f64);
         let mut interval = tokio::time::interval(frame_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -241,6 +266,17 @@ impl<B: CaptureBackend> CaptureService<B> {
                                 None => frame,
                             };
                             self.telemetry.frames_captured += 1;
+                            // The preview's own copy, taken before the frame moves
+                            // into the encoder's buffer. Throttled: a full-size clone
+                            // at capture rate is copying the recording never needs.
+                            if let Some((tx, min_interval)) = &self.preview {
+                                let due = last_preview
+                                    .map_or(true, |t: std::time::Instant| t.elapsed() >= *min_interval);
+                                if due {
+                                    let _ = tx.send(Some(frame.clone()));
+                                    last_preview = Some(std::time::Instant::now());
+                                }
+                            }
                             // Seed-BSR-G1-02-11 / G2-04-11: push to DropOldest
                             // ring buffer; wake the encoder thread.
                             let dropped = {
