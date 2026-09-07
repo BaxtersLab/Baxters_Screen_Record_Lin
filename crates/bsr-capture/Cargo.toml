@@ -1,0 +1,63 @@
+[package]
+name = "bsr-capture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "lib.rs"
+
+[features]
+default = ["linux-capture"]
+
+# Real desktop capture on Linux, via xdg-desktop-portal ScreenCast -> PipeWire.
+# On by default, and there is deliberately NO synthetic fallback behind it: with the
+# feature off, `lib.rs` refuses to compile on Linux rather than producing a screen
+# recorder that cannot see the screen. Building it needs the GStreamer development
+# headers (libgstreamer1.0-dev, libgstreamer-plugins-base1.0-dev) and, at run time,
+# the gstreamer1.0-pipewire plugin. No effect on Windows; the deps are target-gated.
+linux-capture = [
+    "dep:ashpd",
+    "dep:gstreamer",
+    "dep:gstreamer-app",
+    "dep:gstreamer-video",
+    "tokio/net",
+]
+
+[dependencies]
+bsr-core = { path = "../bsr-core" }
+bsr-ipc = { path = "../bsr-ipc" }
+bsr-hrt = { path = "../bsr-hrt" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = "0.1"
+
+# Windows DXGI desktop duplication. Target-gated: it was previously an unconditional
+# dependency, which made every Linux build compile a Windows API crate it can never call.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.54", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+# Linux screen capture. ashpd is a pure-Rust xdg-desktop-portal client (no C deps of
+# its own); the gstreamer crates need the GStreamer development headers at build time.
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"], optional = true }
+gstreamer = { version = "0.25", optional = true }
+gstreamer-app = { version = "0.25", optional = true }
+gstreamer-video = { version = "0.25", optional = true }
+
+[dev-dependencies]
+# Used only by `examples/prove_real_capture.rs`, to write captured frames out as PNGs
+# an operator can look at. Not linked into the library or any product binary.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

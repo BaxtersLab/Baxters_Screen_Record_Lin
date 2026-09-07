@@ -1,0 +1,15 @@
+[package]
+name = "bsr-hrt"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+bsr-core = { path = "../bsr-core" }
+bsr-ipc = { path = "../bsr-ipc" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

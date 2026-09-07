@@ -1,0 +1,22 @@
+[package]
+name = "bsr-encode"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+bsr-core = { path = "../bsr-core" }
+bsr-ipc = { path = "../bsr-ipc" }
+bsr-hrt = { path = "../bsr-hrt" }
+bsr-capture = { path = "../bsr-capture" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = "0.1"
+thiserror = { workspace = true }
+# default-features disabled to drop avdevice (`device`) + avfilter (`filter`), which
+# BSR never uses; keeps the bundle from dragging in the 119 MB avfilter DLL.
+ffmpeg-next = { version = "8", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }

@@ -1,0 +1,63 @@
+# Baxter's Screen Record Configuration Template
+# This file is used as a template for new installations
+# Users can modify these settings, but they will be preserved during updates
+
+[recording]
+# Default output directory (supports environment variables)
+# %USERPROFILE% = C:\Users\Username
+# %USERDOCS% = C:\Users\Username\Documents
+output_dir = "%USERDOCS%\\BSR Recordings"
+
+# Maximum recording duration in hours (0 = unlimited, max 24)
+max_duration_hours = 5
+
+# Video quality settings
+video_bitrate_kbps = 5000  # 5 Mbps
+video_fps = 30
+
+# Encoder settings
+video_codec = "libx264"  # h264, h265
+video_preset = "fast"    # ultrafast, fast, medium, slow
+video_crf = 23          # 0-51, lower = higher quality
+
+# Audio settings (when implemented)
+audio_enabled = false
+audio_bitrate_kbps = 128
+audio_codec = "aac"
+
+[ui]
+# UI appearance
+theme = "charcoal"      # charcoal, light
+window_width = 500
+window_height = 400
+start_minimized = false
+
+# Tray icon settings
+show_tray_icon = true
+minimize_to_tray = true
+
+# Hotkey settings
+global_hotkey_start = "F9"
+global_hotkey_stop = "F10"
+
+[logging]
+# Logging configuration
+level = "info"          # error, warn, info, debug, trace
+max_files = 5           # Number of log files to keep
+max_file_size_mb = 10   # Max size per log file
+
+# Log to file (in addition to console)
+file_logging = true
+
+[advanced]
+# Advanced settings (usually don't need to change)
+ffmpeg_path = "ffmpeg"  # Path to FFmpeg binaries (relative to exe)
+temp_dir = "%TEMP%\\bsr" # Temporary directory for processing
+
+# Performance settings
+worker_threads = 0      # 0 = auto-detect CPU cores
+buffer_size_mb = 64     # Memory buffer for encoding
+
+# Debug settings
+enable_telemetry = true
+enable_diagnostics = true

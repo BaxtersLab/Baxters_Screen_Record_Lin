@@ -1,0 +1,18 @@
+# BSR Backup Exclusion List
+# Directories and files to exclude from source code backup
+
+target\
+.git\
+.vscode\
+node_modules\
+*.log
+*.tmp
+Thumbs.db
+.DS_Store
+backup\
+dist\
+installer\
+.vcpkg\
+pkgconfig\
+pkgconfig.exe
+pkgconfig.zip

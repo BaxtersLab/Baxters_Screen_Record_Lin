@@ -1,0 +1,56 @@
+[package]
+name = "bsr-ui"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+path = "lib.rs"
+
+[[bin]]
+name = "bsr-ui"
+path = "main.rs"
+
+[dependencies]
+bsr-core = { path = "../bsr-core" }
+bsr-ipc = { path = "../bsr-ipc" }
+bsr-hrt = { path = "../bsr-hrt" }
+bsr-capture = { path = "../bsr-capture" }
+bsr-encode = { path = "../bsr-encode" }
+bsr-mux = { path = "../bsr-mux" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+
+eframe = "0.27"
+egui = "0.27"
+tray-icon = "0.13"
+global-hotkey = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+glob = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# tray-icon on Linux is GTK + libayatana-appindicator, and the *caller* must call
+# gtk::init() and run a GTK main loop. eframe/winit does neither, so the tray has to
+# own a GTK thread. Already in the tree transitively via tray-icon; declared here
+# because bsr-ui now names it directly.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+# Native "choose where" dialog via xdg-desktop-portal. Same portal family the capture
+# backend already uses, so no new system dependency.
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "file_chooser"] }
+url = "2"
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+ico = "0.3"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+# Only for the save-guard tests, which need real files on disk to compare inodes.
+tempfile = "3"

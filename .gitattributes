@@ -1,0 +1,22 @@
+# Normalise line endings in the repository.
+#
+# This tree came from a Windows-first checkout and every file in the working copy still
+# has CRLF endings, while the git blobs hold LF. That produced a permanent phantom diff —
+# `git diff --stat` reported 63 files and 9416 insertions / 9416 deletions with ZERO
+# content difference, which made "is this tree dirty?" unanswerable at a glance.
+#
+# `text=auto` stores LF in the repository and checks out the platform's native ending, so
+# the diff reflects real changes only.
+* text=auto
+
+# Explicitly binary, so git never tries to normalise or diff them as text.
+*.png binary
+*.jpg binary
+*.ico binary
+*.mp4 binary
+*.deb binary
+*.zip binary
+
+# Shell scripts and Rust stay LF even on Windows: a CRLF shebang line is not executable.
+*.sh text eol=lf
+*.rs text eol=lf

@@ -1,0 +1,26 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Baxter's Screen Record
+GenericName=Screen Recorder
+Comment=Record your screen to MP4, with a croppable record space
+# MUST be run.sh, never the binary. run.sh performs the snap-environment scrub and,
+# critically for this app, strips the inherited GDK_BACKEND=x11. BSR captures the
+# screen: under X11 on a Wayland session it records SOLID BLACK and logs nothing.
+# A desktop-entry launch never sees a terminal's environment fixes, so exec'ing the
+# binary here would silently produce black recordings from the taskbar while
+# terminal launches worked fine.
+Exec=@TREE@/run.sh
+TryExec=@TREE@/run.sh
+Path=@TREE@
+Icon=baxters-screen-record
+Terminal=false
+Categories=AudioVideo;Recorder;
+Keywords=baxters;screen;record;capture;recorder;screencast;bsr;
+StartupNotify=true
+# Pairs the running window with this launcher so the dock and Alt-Tab show the real
+# icon. Under native Wayland GNOME matches the window's app_id against this FILE'S
+# NAME, which is why ViewportBuilder::with_app_id("baxters-screen-record") in
+# crates/bsr-ui/main.rs must stay in step with this filename. StartupWMClass covers
+# executable/window-class fallback matching when Shell cannot associate by app_id.
+StartupWMClass=bsr-ui

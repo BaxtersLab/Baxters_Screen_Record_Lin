@@ -1,0 +1,11 @@
+FFmpeg DLLs are dynamically linked and distributed with Baxter's Screen Record.
+
+FFmpeg is licensed under the GNU Lesser General Public License (LGPL) version 2.1 or later.
+
+See https://ffmpeg.org/legal.html for full license text.
+
+This project uses ffmpeg-next (MIT) Rust crate and links to FFmpeg DLLs at runtime.
+
+No modifications to FFmpeg source are made.
+
+Redistribution of FFmpeg DLLs must comply with LGPL requirements.

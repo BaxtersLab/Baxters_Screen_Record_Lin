@@ -1,0 +1,60 @@
+# ─── Build output ────────────────────────────────────────────────────────────
+target/
+**/target/
+dist/
+*.deb
+output/
+**/output/
+
+# Cargo.lock IS committed: this is a binary/app workspace, and it pins
+# ffmpeg-next/ffmpeg-sys-next to 8.1.0 (the versions that compile against the
+# FFmpeg 8.x dev libs). A fresh resolve of `ffmpeg-next = "8"` picks a version that
+# fails to build, so the lock is required for a reproducible clone → build.
+
+# ─── Internal working documents — MUST NOT be published ──────────────────────
+# These are the estate's own notes: operator quotes, other projects' names, test-box
+# procedures, recovery ladders and box-specific hardware detail. None of it is secret,
+# but none of it belongs in a public repository either, and a public commit cannot be
+# un-published — history, forks and mirrors make it permanent.
+handoffs.md
+HANDOFF.md
+BSR_HANDOFF.md
+BSR_RECONCILE_PLAN.md
+DOCK-ICON-HANDOFF.md
+TEST-BOX-*.md
+saddle/
+bsr-module-blocks/
+
+# `fw_satellite.rs` and `bsr_telemetry_server.ps1` are excluded for DISCLOSURE, not
+# ownership. `fw_satellite.rs` is BSR's own copy of the shared FullWrapper satellite
+# ("deployed to each Rust app in the ecosystem", stamped APP_CODE = "BSR") — it belongs
+# to BSR by design. Both are Windows-only in their transport (`\\.\pipe\...`), are dead
+# on Linux, and together they describe the ecosystem's internal telemetry channel and its
+# pipe naming. Publishing that reveals estate architecture for no benefit to anyone
+# building this app. Keep them in the tree; keep them out of a public repo.
+fw_satellite.rs
+bsr_telemetry_server.ps1
+
+# ─── Runtime and local state ─────────────────────────────────────────────────
+*.log
+*.jsonl
+.bsr_fragment_seq
+bsr-config.toml
+**/screencast_restore_token
+
+# ─── Editor / OS ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.rs.bk
+*~
+
+# ─── Binary cruft that should never be committed from a source tree ──────────
+*.tmp
+*.dmp
+*.pdb
+*.exe
+*.dll
+*.zip
+backup/

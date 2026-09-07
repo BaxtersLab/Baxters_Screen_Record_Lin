@@ -1,0 +1,19 @@
+[package]
+name = "bsr-real-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["alloc"] }
+
+bsr-ipc = { path = "../../crates/bsr-ipc" }
+bsr-capture = { path = "../../crates/bsr-capture" }
+bsr-encode = { path = "../../crates/bsr-encode" }
+bsr-mux = { path = "../../crates/bsr-mux" }
+bsr-core = { path = "../../crates/bsr-core" }
+
+[workspace]

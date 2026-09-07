@@ -1,0 +1,12 @@
+[package]
+name = "bsr-telemetry-shim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+named_pipe = "0.4"
+serde_json = "1.0"
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["alloc"] }
+
+[workspace]

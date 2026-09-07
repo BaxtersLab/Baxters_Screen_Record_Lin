@@ -1,0 +1,39 @@
+[package]
+name = "bsr-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The library is an empty shim. All the value is in the [[test]] targets below, which
+# point at the repository-root `tests/` directory where these files already live.
+[lib]
+path = "src/lib.rs"
+
+# Explicit test targets. Cargo only auto-discovers `tests/` inside a package, and these
+# deliberately stay at the repository root: they are integration tests for the workspace
+# as a whole, not for any one crate. Without this package nothing compiled them at all.
+[[test]]
+name = "ipc_lifecycle"
+path = "../../tests/ipc_lifecycle.rs"
+
+[[test]]
+name = "record_space"
+path = "../../tests/record_space.rs"
+
+[[test]]
+name = "pipeline_e2e"
+path = "../../tests/pipeline_e2e.rs"
+
+[dev-dependencies]
+bsr-core = { path = "../bsr-core" }
+bsr-ipc = { path = "../bsr-ipc" }
+bsr-capture = { path = "../bsr-capture" }
+bsr-encode = { path = "../bsr-encode" }
+bsr-mux = { path = "../bsr-mux" }
+bsr-ui = { path = "../bsr-ui" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+# Must match bsr-encode/bsr-mux exactly: the default features pull in libavdevice and
+# libavfilter, whose dev headers are deliberately not installed on this box.
+ffmpeg-next = { version = "8", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
+tempfile = "3"
