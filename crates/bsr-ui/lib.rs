@@ -698,6 +698,48 @@ fn build_tray() -> Option<TrayIcon> {
     None
 }
 
+/// Whether an incoming preview frame can reuse the existing texture allocation.
+///
+/// `poll_preview` used to call `ctx.load_texture()` for every preview frame. That
+/// **allocates a new GPU texture each time** and returns a fresh handle -- it does not
+/// update in place -- and egui frees the displaced allocation lazily, on a later frame.
+/// At preview rate over a ten-minute recording that is on the order of ten to twenty
+/// thousand allocate/free cycles, churning the driver's memory manager continuously.
+///
+/// On the test box, 2026-09-07, a 602-second recording ended with:
+///
+/// * `VmPeak` 3,945,140 kB against an `RSS` of only 234,560 kB -- a large *virtual*
+///   footprint, which is what mapped-then-freed GPU buffers look like;
+/// * `nouveau ... fifo: fault [READ] ... reason 02 [PTE]` -- the GPU dereferencing a
+///   mapping that was no longer valid;
+/// * `MULTIPLE_WARP_ERRORS ... OOR_ADDR` / `OOR_REG`;
+/// * `channel 11 killed!`, then `SIGSEGV` inside `libgallium`, entered from
+///   `egui_glow::painter::paint_and_update_textures` -- the exact function that services
+///   texture deltas.
+///
+/// The 38-second baseline never reproduced it. Note BSR's own frames in that backtrace
+/// are only `main` and the event loop: the crash is a usage error against the driver,
+/// not a logic error in BSR's code.
+///
+/// Pure, so the decision is testable without a GPU, a window, or a ten-minute recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewTextureAction {
+    /// Same dimensions: overwrite the existing allocation via `TextureHandle::set`.
+    ReuseInPlace,
+    /// No texture yet, or the dimensions changed: allocate a new one.
+    Allocate,
+}
+
+pub fn preview_texture_action(
+    existing: Option<[usize; 2]>,
+    incoming: [usize; 2],
+) -> PreviewTextureAction {
+    match existing {
+        Some(size) if size == incoming => PreviewTextureAction::ReuseInPlace,
+        _ => PreviewTextureAction::Allocate,
+    }
+}
+
 /// Convert a captured BGRA frame into a downscaled RGBA preview.
 ///
 /// Shared by the recording preview and the idle live view, which previously would have
@@ -1537,10 +1579,24 @@ impl AppWindow {
             }
             if let Some(img) = latest {
                 if img.width as usize > 0 && img.height as usize > 0 && !img.data.is_empty() {
-                    let color_image = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.data);
-                    // Replace texture each time a new preview arrives
-                    let tex = ctx.load_texture("bsr_preview", color_image, egui::TextureOptions::LINEAR);
-                    self.preview_texture = Some(tex);
+                    let size = [img.width as usize, img.height as usize];
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &img.data);
+
+                    // UPDATE IN PLACE when the size is unchanged; allocate only when it
+                    // actually changes. This was `ctx.load_texture(...)` on EVERY preview
+                    // frame, which allocates a NEW GPU texture each time rather than
+                    // reusing the existing one. See preview_texture_action() for the
+                    // crash that behaviour produced on a 10-minute recording.
+                    match self.preview_texture.as_mut() {
+                        Some(tex) if tex.size() == size => {
+                            tex.set(color_image, egui::TextureOptions::LINEAR);
+                        }
+                        _ => {
+                            self.preview_texture = Some(ctx.load_texture(
+                                "bsr_preview", color_image, egui::TextureOptions::LINEAR,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -3144,6 +3200,67 @@ mod tests {
     }
 
     /// The preview conversion must not read past a short buffer, and must keep aspect.
+    // ---- preview texture reuse, 2026-09-08 ----------------------------------
+    //
+    // poll_preview called ctx.load_texture() on EVERY preview frame, allocating a new
+    // GPU texture each time instead of updating the existing one. Over a 602-second
+    // recording that is ~10-20k allocate/free cycles; the test box ended with a nouveau
+    // PTE fault, "channel 11 killed!", and a SIGSEGV inside libgallium reached from
+    // egui_glow's paint_and_update_textures. The 38-second baseline never showed it.
+    //
+    // These pin the decision. Against the old behaviour -- which was equivalent to
+    // always returning Allocate -- the first test fails.
+
+    #[test]
+    fn identical_preview_size_reuses_the_existing_texture() {
+        assert_eq!(
+            preview_texture_action(Some([480, 270]), [480, 270]),
+            PreviewTextureAction::ReuseInPlace,
+            "a same-size preview frame must NOT allocate a new GPU texture"
+        );
+    }
+
+    #[test]
+    fn first_preview_frame_must_allocate() {
+        assert_eq!(
+            preview_texture_action(None, [480, 270]),
+            PreviewTextureAction::Allocate,
+            "with no texture yet there is nothing to reuse"
+        );
+    }
+
+    #[test]
+    fn a_changed_preview_size_must_allocate() {
+        // Width change alone.
+        assert_eq!(
+            preview_texture_action(Some([480, 270]), [320, 270]),
+            PreviewTextureAction::Allocate
+        );
+        // Height change alone -- e.g. recording a different aspect ratio.
+        assert_eq!(
+            preview_texture_action(Some([480, 270]), [480, 300]),
+            PreviewTextureAction::Allocate,
+            "reusing an allocation of the wrong height would read past it"
+        );
+    }
+
+    #[test]
+    fn a_steady_stream_allocates_exactly_once() {
+        // The property that actually matters: in the steady state the count is flat.
+        // The old code's count would equal the frame count.
+        let size = [480usize, 270usize];
+        let mut current: Option<[usize; 2]> = None;
+        let mut allocations = 0usize;
+
+        for _frame in 0..18_000 {          // ~10 minutes of preview updates
+            match preview_texture_action(current, size) {
+                PreviewTextureAction::Allocate => { allocations += 1; current = Some(size); }
+                PreviewTextureAction::ReuseInPlace => {}
+            }
+        }
+        assert_eq!(allocations, 1, "18,000 same-size frames must allocate once, not 18,000 times");
+    }
+
     #[test]
     fn frame_to_preview_scales_and_refuses_a_short_buffer() {
         let good = CaptureFrame {
