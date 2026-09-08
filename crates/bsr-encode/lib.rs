@@ -380,6 +380,143 @@ mod tests {
         assert!(got_packet, "Expected at least one packet after 30 frames");
     }
 
+    // ---- stride regression, 2026-09-07 --------------------------------------
+    //
+    // The test box recorded a 1842x934 crop on 2026-09-07 and every frame came back
+    // split into severe diagonal displaced bands, while the 1920x1080 baseline was
+    // pristine and the file decoded with ZERO ffmpeg errors. Cause: encode_frame
+    // copied the packed BGRA buffer into the FFmpeg plane as one flat memcpy,
+    // ignoring the plane's ALIGNED linesize.
+    //
+    //     1920 wide -> packed row 7680 == linesize 7680 -> drift 0     (invisible)
+    //     1842 wide -> packed row 7368 vs linesize 7424 -> drift 56/row
+    //
+    // Every encoder test in this file used 1280x720 or 1920x1080. Both are already
+    // stride-aligned, which is exactly why this survived the project's whole life.
+    // These tests use deliberately UNALIGNED dimensions.
+
+    #[test]
+    fn packed_rows_land_on_stride_boundaries_not_packed_ones() {
+        // 3 rows of 5 bytes packed, into a plane with 8-byte rows.
+        let src: Vec<u8> = vec![1, 1, 1, 1, 1,
+                                2, 2, 2, 2, 2,
+                                3, 3, 3, 3, 3];
+        let mut dst = vec![0u8; 8 * 3];
+        backends::h264::copy_packed_into_plane(&mut dst, 8, &src, 5, 3).unwrap();
+
+        // Each row must start at a multiple of the DESTINATION stride.
+        assert_eq!(&dst[0..5],   &[1, 1, 1, 1, 1], "row 0 misplaced");
+        assert_eq!(&dst[8..13],  &[2, 2, 2, 2, 2], "row 1 misplaced -- this is the shear");
+        assert_eq!(&dst[16..21], &[3, 3, 3, 3, 3], "row 2 misplaced -- shear accumulates");
+
+        // The padding between rows must be left alone, not overwritten with pixels.
+        assert_eq!(&dst[5..8],   &[0, 0, 0], "row 0 padding was written into");
+        assert_eq!(&dst[13..16], &[0, 0, 0], "row 1 padding was written into");
+    }
+
+    #[test]
+    fn a_flat_memcpy_would_shear_an_unaligned_frame() {
+        // Demonstrates the OLD behaviour is genuinely wrong, so this suite documents
+        // the defect rather than only asserting the fix.
+        let w = 1842usize;                 // the real crop width from the test box
+        let src_stride = w * 4;            // 7368, packed
+        let dst_stride = 7424usize;        // 64-aligned linesize ffmpeg would allocate
+        assert_ne!(src_stride, dst_stride, "pick a width that is actually unaligned");
+
+        // Mark the FIRST byte of each row. A row filled uniformly cannot expose the
+        // shear -- reading 56 bytes into the same row returns the same value -- so the
+        // marker is what makes the drift observable at all.
+        let rows = 4usize;
+        let mut src = vec![0u8; src_stride * rows];
+        for y in 0..rows {
+            src[y * src_stride] = 0xFF;                       // row-start marker
+            for x in 1..src_stride { src[y * src_stride + x] = y as u8 + 1; }
+        }
+
+        let mut correct = vec![0u8; dst_stride * rows];
+        backends::h264::copy_packed_into_plane(
+            &mut correct, dst_stride, &src, src_stride, rows,
+        ).unwrap();
+
+        let mut flat = vec![0u8; dst_stride * rows];
+        flat[..src.len()].copy_from_slice(&src);   // the old, buggy copy
+
+        // Correct: every row begins on a destination-stride boundary, marker intact.
+        for y in 0..rows {
+            assert_eq!(correct[y * dst_stride], 0xFF,
+                "row {y} must begin at y*dst_stride");
+        }
+        // Buggy: rows 1+ drift by 56 bytes each, so the marker is NOT at the boundary.
+        assert_eq!(flat[0], 0xFF, "row 0 is correct either way -- the drift accumulates");
+        for y in 1..rows {
+            assert_ne!(flat[y * dst_stride], 0xFF,
+                "a flat memcpy must NOT land row {y}'s marker on the boundary");
+        }
+        assert_ne!(correct, flat, "the two copies must differ, or the test proves nothing");
+    }
+
+    #[test]
+    fn aligned_width_is_the_case_that_hid_the_bug() {
+        // 1920*4 = 7680 is already 64-aligned, so packed == linesize and a flat memcpy
+        // happens to be correct. Kept so the asymmetry is explicit in the suite.
+        let w = 1920usize;
+        let stride = w * 4;
+        assert_eq!(stride % 64, 0, "1920 BGRA rows are 64-aligned");
+
+        let rows = 3usize;
+        let src: Vec<u8> = (0..rows).flat_map(|y| vec![y as u8 + 1; stride]).collect();
+        let mut dst = vec![0u8; stride * rows];
+        backends::h264::copy_packed_into_plane(&mut dst, stride, &src, stride, rows).unwrap();
+        assert_eq!(dst, src, "with equal strides the copy is a straight image");
+    }
+
+    #[test]
+    fn refuses_a_destination_narrower_than_a_row() {
+        let src = vec![0u8; 40];
+        let mut dst = vec![0u8; 40];
+        let err = backends::h264::copy_packed_into_plane(&mut dst, 4, &src, 8, 5)
+            .expect_err("a linesize shorter than a packed row must be refused, not truncated");
+        assert!(err.contains("shorter"), "error should name the problem: {err}");
+    }
+
+    #[test]
+    fn test_h264_encode_frame_at_an_unaligned_width() {
+        // The end-to-end shape of the test-box failure: a crop whose width is not
+        // stride-aligned must still encode.
+        let (w, h) = (1842u32, 934u32);
+        assert_ne!((w as usize * 4) % 64, 0, "width must be unaligned for this to test anything");
+
+        let config = EncoderConfig {
+            codec: "h264".to_string(),
+            preset: "ultrafast".to_string(),
+            bitrate_kbps: 5000,
+            width: w,
+            height: h,
+            fps: 30,
+        };
+        let mut backend = backends::h264::H264EncoderBackend::new(&config).unwrap();
+        backend.initialize(&config).unwrap();
+
+        let frame = CaptureFrame {
+            data: vec![0u8; w as usize * h as usize * 4],
+            timestamp: 123456789,
+            width: w,
+            height: h,
+            format: FrameFormat::Bgra8,
+        };
+
+        let mut got_packet = false;
+        for _ in 0..30 {
+            if let Ok(Some(packet)) = backend.encode_frame(&frame) {
+                assert_eq!(packet.codec, "h264");
+                assert!(!packet.data.is_empty());
+                got_packet = true;
+                break;
+            }
+        }
+        assert!(got_packet, "an unaligned-width frame must encode");
+    }
+
     #[test]
     fn test_h264_shutdown() {
         let config = EncoderConfig::default();

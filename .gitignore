@@ -60,3 +60,6 @@ bsr-config.toml
 *.dll
 *.zip
 backup/
+
+# Local pre-change snapshots. Useful on the workstation, noise in a public tree.
+*.bak
