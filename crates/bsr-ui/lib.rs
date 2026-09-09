@@ -374,6 +374,8 @@ pub use bsr_core::config::BsrConfig;
 pub struct UiDiagnostics {
     pub lines: Vec<String>,
     pub timestamps: Vec<String>,
+    /// How many lines have been discarded by the MAX_LINES cap since start.
+    pub dropped: usize,
 }
 
 impl UiDiagnostics {
@@ -387,6 +389,11 @@ impl UiDiagnostics {
         
         if self.lines.len() > MAX_LINES {
             let overflow = self.lines.len() - MAX_LINES;
+            // Count what we drop. The panel showed 50 lines with no indication that older
+            // ones had been discarded, so a tester asked for "the full log" was chasing
+            // text that no longer existed. Silent truncation on a diagnostics panel is
+            // the same class of defect as a silent no-op.
+            self.dropped = self.dropped.saturating_add(overflow);
             self.lines.drain(0..overflow);
             self.timestamps.drain(0..overflow);
         }
@@ -696,6 +703,38 @@ fn build_tray() -> Option<TrayIcon> {
         tracing::warn!("system tray disabled: could not spawn GTK thread: {e}");
     }
     None
+}
+
+/// Render the diagnostics log as plain text for the clipboard.
+///
+/// The panel draws each line with `ui.label()`, and **egui labels are not selectable** --
+/// so Ctrl+C could never have worked, and dragging across a scrolling area cancels the
+/// selection anyway. The test box hit exactly this on 2026-09-07 and could only ever
+/// return *partial* diagnostics, which limits every round's evidence.
+///
+/// Also states the truncation explicitly. `UiDiagnostics` keeps only the newest
+/// `MAX_LINES`; a ten-minute session silently discards everything older. Someone asked
+/// for "the full log" was chasing text that had already been dropped.
+///
+/// Pure, so the exact bytes a tester will paste back can be asserted in a unit test.
+pub fn diagnostics_to_text(lines: &[String], timestamps: &[String], dropped: usize) -> String {
+    let mut out = String::new();
+    if dropped > 0 {
+        // Deliberately does not quote a cap size: the only number in scope here is the
+        // CURRENT line count, which equals the cap only by coincidence. Stating a wrong
+        // number would be worse than stating none.
+        out.push_str(&format!(
+            "[note] {dropped} earlier line(s) were discarded by the panel's line cap \
+and are not recoverable from this log.\n"
+        ));
+    }
+    for (i, line) in lines.iter().enumerate() {
+        match timestamps.get(i) {
+            Some(ts) => out.push_str(&format!("[{ts}] {line}\n")),
+            None => out.push_str(&format!("{line}\n")),
+        }
+    }
+    out
 }
 
 /// Whether an incoming preview frame can reuse the existing texture allocation.
@@ -2658,8 +2697,36 @@ impl AppWindow {
 
     fn render_diagnostics(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
-            ui.label(egui::RichText::new("Diagnostics").font(egui::FontId::proportional(16.0)))
-                .on_hover_text("Messages about recording activity and system behavior.");
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Diagnostics").font(egui::FontId::proportional(16.0)))
+                    .on_hover_text("Messages about recording activity and system behavior.");
+
+                // Copy button. The lines below are drawn with ui.label(), which egui does
+                // NOT make selectable -- so Ctrl+C never worked and a tester could only
+                // ever return a partial log. This is the supported way to get all of it.
+                if ui.button("Copy")
+                    .on_hover_text("Copy the whole log to the clipboard")
+                    .clicked()
+                {
+                    let text = diagnostics_to_text(
+                        &self.model.diagnostics.lines,
+                        &self.model.diagnostics.timestamps,
+                        self.model.diagnostics.dropped,
+                    );
+                    ui.output_mut(|o| o.copied_text = text);
+                }
+
+                // Never let the cap truncate in silence.
+                if self.model.diagnostics.dropped > 0 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "({} earlier line(s) dropped)", self.model.diagnostics.dropped
+                        ))
+                        .color(egui::Color32::from_rgb(0xCC, 0x99, 0x33)),
+                    )
+                    .on_hover_text("The panel keeps only the most recent lines. Older ones are gone.");
+                }
+            });
             ui.separator();
             
             let mut scroll_area = egui::ScrollArea::vertical().max_height(80.0);
@@ -3200,6 +3267,58 @@ mod tests {
     }
 
     /// The preview conversion must not read past a short buffer, and must keep aspect.
+    // ---- diagnostics export, 2026-09-09 -------------------------------------
+    //
+    // The test box could only ever return PARTIAL diagnostics: the panel draws each line
+    // with ui.label(), which egui does not make selectable, so Ctrl+C never worked, and
+    // dragging across a scrolling area cancels the selection. A Copy button is the fix.
+    // Separately, MAX_LINES silently discarded the oldest lines, so "the full log" a
+    // tester was asked for had in part already ceased to exist.
+
+    #[test]
+    fn diagnostics_text_pairs_each_line_with_its_timestamp() {
+        let lines = vec!["started".to_string(), "finalised".to_string()];
+        let ts = vec!["00:00:01".to_string(), "00:10:04".to_string()];
+        let out = diagnostics_to_text(&lines, &ts, 0);
+        assert_eq!(out, "[00:00:01] started\n[00:10:04] finalised\n");
+    }
+
+    #[test]
+    fn diagnostics_text_announces_dropped_lines() {
+        let lines = vec!["newest".to_string()];
+        let ts = vec!["00:10:04".to_string()];
+        let out = diagnostics_to_text(&lines, &ts, 137);
+        assert!(out.starts_with("[note] 137 earlier line(s) were discarded"),
+            "truncation must be stated, not silent: {out}");
+        assert!(out.contains("[00:10:04] newest"), "the surviving lines must still be there");
+    }
+
+    #[test]
+    fn diagnostics_text_is_silent_when_nothing_was_dropped() {
+        let lines = vec!["only line".to_string()];
+        let ts = vec!["00:00:01".to_string()];
+        let out = diagnostics_to_text(&lines, &ts, 0);
+        assert!(!out.contains("[note]"), "no note when nothing was lost: {out}");
+    }
+
+    #[test]
+    fn diagnostics_text_survives_a_missing_timestamp() {
+        // timestamps and lines are two parallel Vecs; a desync must not panic or drop text.
+        let lines = vec!["a".to_string(), "b".to_string()];
+        let ts = vec!["t0".to_string()];
+        let out = diagnostics_to_text(&lines, &ts, 0);
+        assert_eq!(out, "[t0] a\nb\n", "the unpaired line must still be exported");
+    }
+
+    #[test]
+    fn dropped_count_tracks_what_the_cap_discarded() {
+        let mut d = UiDiagnostics::default();
+        for i in 0..60 { d.push(format!("line {i}")); }
+        assert_eq!(d.lines.len(), 50, "cap still holds");
+        assert_eq!(d.dropped, 10, "the 10 discarded lines must be counted, not lost silently");
+        assert!(d.lines[0].contains("line 10"), "the oldest survivor is line 10");
+    }
+
     // ---- preview texture reuse, 2026-09-08 ----------------------------------
     //
     // poll_preview called ctx.load_texture() on EVERY preview frame, allocating a new
