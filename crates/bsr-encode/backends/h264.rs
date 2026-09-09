@@ -155,7 +155,14 @@ impl H264EncoderBackend {
         // are only the same number when the packed row already happens to be aligned:
         //
         //     1920 wide -> packed row 7680 == linesize 7680  -> drift 0     (clean)
-        //     1842 wide -> packed row 7368 vs linesize 7424  -> drift 56/row
+        //     1842 wide -> packed row 7368 vs linesize 7392  -> drift 24/row = 6 px
+        //     1030 wide -> packed row 4120 vs linesize 4128  -> drift  8/row = 2 px
+        //
+        // MEASURED, not assumed: the test box shot both widths on 2026-09-08 and got a
+        // modal per-row shift of exactly -6 px and -2 px, 99.6% agreement. That fits a
+        // 32-BYTE alignment and falsifies the 64-byte figure this comment first carried.
+        // The fix does not depend on the constant -- it reads stride(0) -- but a reader
+        // computing the drift by hand needs the right number.
         //
         // A flat memcpy therefore starts each row a little earlier than the frame expects,
         // and the error accumulates down the image as progressive diagonal displaced bands.

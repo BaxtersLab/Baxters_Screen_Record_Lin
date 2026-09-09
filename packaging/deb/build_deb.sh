@@ -22,6 +22,28 @@ trap 'rm -rf "$STAGE"' EXIT
 BIN="$TREE/target/release/bsr-ui"
 [ -x "$BIN" ] || { echo "build_deb: $BIN missing — run: cargo build --release -p bsr-ui" >&2; exit 1; }
 
+# REFUSE A STALE BINARY.
+#
+# This check only tested that the binary EXISTS. On 2026-09-08 that shipped
+# baxters-screen-record 1.0.0-12 carrying a bsr-ui byte-identical to 1.0.0-11: two fixes
+# had been written and tested in DEBUG, `cargo build --release` was never run, and the
+# release binary was 14 hours older than the source. The test box caught it by hashing
+# the shipped binary against the previous round's -- the package looked new because only
+# the Version: line had changed.
+#
+# A version bump is not evidence. Compare timestamps against every tracked source file
+# and refuse to package a binary older than the code it claims to contain.
+newer=$(find "$TREE/crates" "$TREE/Cargo.toml" "$TREE/Cargo.lock" \
+          -name target -prune -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
+          -newer "$BIN" -print 2>/dev/null | head -5)
+if [ -n "$newer" ]; then
+    echo "build_deb: REFUSING — $BIN is older than source that changed since it was built:" >&2
+    echo "$newer" | sed 's|^|  |' >&2
+    echo "  run: cargo build --release -p bsr-ui" >&2
+    exit 1
+fi
+echo "build_deb: release binary is newer than all tracked source (stale-binary check passed)"
+
 APPDIR="$STAGE/opt/baxters/screen-record"
 mkdir -p "$APPDIR" "$STAGE/DEBIAN" \
          "$STAGE/usr/share/applications" \

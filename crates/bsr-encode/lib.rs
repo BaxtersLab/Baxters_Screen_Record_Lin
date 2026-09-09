@@ -389,7 +389,11 @@ mod tests {
     // ignoring the plane's ALIGNED linesize.
     //
     //     1920 wide -> packed row 7680 == linesize 7680 -> drift 0     (invisible)
-    //     1842 wide -> packed row 7368 vs linesize 7424 -> drift 56/row
+    //     1842 wide -> packed row 7368 vs linesize 7392 -> drift 24/row = 6 px
+    //     1030 wide -> packed row 4120 vs linesize 4128 -> drift  8/row = 2 px
+    //
+    // Those pixel figures are MEASURED: the test box shot both widths on 2026-09-08 and
+    // read a modal per-row shift of -6 and -2 at 99.6% agreement. 32-byte alignment.
     //
     // Every encoder test in this file used 1280x720 or 1920x1080. Both are already
     // stride-aligned, which is exactly why this survived the project's whole life.
@@ -420,7 +424,7 @@ mod tests {
         // the defect rather than only asserting the fix.
         let w = 1842usize;                 // the real crop width from the test box
         let src_stride = w * 4;            // 7368, packed
-        let dst_stride = 7424usize;        // 64-aligned linesize ffmpeg would allocate
+        let dst_stride = 7392usize;        // 32-aligned linesize, MEASURED on the test box 2026-09-08
         assert_ne!(src_stride, dst_stride, "pick a width that is actually unaligned");
 
         // Mark the FIRST byte of each row. A row filled uniformly cannot expose the
