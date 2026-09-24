@@ -197,6 +197,7 @@ mod tests {
     #[tokio::test]
     async fn test_muxer_service_duration_cap() {
         let config = bsr_ipc::MuxerConfig {
+            extradata: None,
             max_duration: std::time::Duration::from_millis(100),
             ..Default::default()
         };
@@ -284,7 +285,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_muxer_finalizes_on_shutdown() {
-        let config = bsr_ipc::MuxerConfig::default();
+        // Real parameter sets: the muxer refuses to start without them, because
+        // a recording written without them cannot be played back.
+        let enc_cfg = bsr_encode::EncoderConfig {
+            codec: "h264".into(),
+            preset: "ultrafast".into(),
+            bitrate_kbps: 1000,
+            width: 320,
+            height: 240,
+            fps: 30,
+        };
+        let extradata = bsr_encode::H264EncoderBackend::new(&enc_cfg)
+            .ok()
+            .and_then(|e| e.extradata());
+        let config = bsr_ipc::MuxerConfig { extradata, ..Default::default() };
         let (_packet_tx, packet_rx) = mpsc::channel(10);
         let (telemetry_tx, _) = mpsc::channel(10);
         let (command_tx, command_rx) = mpsc::channel(10);

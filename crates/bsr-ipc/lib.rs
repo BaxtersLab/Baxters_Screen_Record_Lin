@@ -63,6 +63,15 @@ pub struct MuxerConfig {
     pub width: u32,
     #[serde(default = "default_muxer_height")]
     pub height: u32,
+    /// The encoder's H.264 parameter sets (SPS/PPS), which the container must
+    /// carry so the stream can be described without reading the whole file.
+    ///
+    /// Without them a recording is only readable once a complete index has been
+    /// written at the end, so an unclean stop loses everything. Supplied by the
+    /// encoder once it is open; `None` means "not known", and the muxer then
+    /// falls back to the old in-band-only behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extradata: Option<Vec<u8>>,
 }
 
 fn default_muxer_fps() -> u32 {
@@ -106,6 +115,7 @@ impl Default for MuxerConfig {
             fps: default_muxer_fps(),
             width: default_muxer_width(),
             height: default_muxer_height(),
+            extradata: None,
         }
     }
 }
@@ -596,6 +606,7 @@ mod tests {
     #[test]
     fn test_muxer_config_roundtrip() {
         let cfg = MuxerConfig {
+            extradata: None,
             base_output_path: std::path::PathBuf::from("test"),
             file_naming_strategy: FileNamingStrategy::TimestampedFile,
             max_duration: std::time::Duration::from_secs(100),

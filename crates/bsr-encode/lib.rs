@@ -118,6 +118,16 @@ pub struct EncoderService {
 }
 
 impl EncoderService {
+    /// The H.264 parameter sets (SPS/PPS) the muxer must be given.
+    ///
+    /// The encoder is opened with GLOBAL_HEADER, so these are NOT repeated
+    /// inside the video data; a recording whose container lacks them cannot be
+    /// played back. The muxer refuses to start without them rather than write
+    /// such a file.
+    pub fn extradata(&self) -> Option<Vec<u8>> {
+        self.backend.extradata()
+    }
+
     pub fn new(
         config: EncoderConfig,
         telemetry_tx: broadcast::Sender<TelemetryEvent>,

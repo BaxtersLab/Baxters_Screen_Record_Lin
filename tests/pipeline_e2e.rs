@@ -101,6 +101,10 @@ async fn record_with_insets(h: &TestHarness, l: u32, t: u32, r: u32, b: u32) -> 
     enc.initialize(&enc_cfg).expect("encoder initialize");
 
     let mut cfg = settings.to_muxer_config();
+    // Exactly what bsr-ui does when a recording starts: hand the encoder's
+    // parameter sets to the muxer. to_muxer_config() cannot know them, because
+    // they only exist once an encoder is open.
+    cfg.extradata = enc.extradata();
     cfg.file_naming_strategy = bsr_ipc::FileNamingStrategy::Simple("take.mp4".into());
     let out = cfg.preview_output_path();
 
@@ -187,12 +191,25 @@ async fn an_odd_crop_still_produces_a_playable_file() {
 /// exactly this window and keep the broken copy forever.
 ///
 /// This asserts the window is real, and that it closes only when the muxer task
-/// completes. Deterministic: the "before" check happens with no stop requested at all,
-/// so no trailer can possibly have been written yet.
+
+/// **A recording in progress is already playable.**
+///
+/// This test used to assert the opposite — that a file could not be opened until
+/// the muxer wrote its trailer — and used that as the signal for the save-offer
+/// race. That was pinning a defect: it meant every recording that did not end
+/// cleanly was lost. Measured on the operator's own files, 2026-09-24: 6 of 21
+/// unplayable with "moov atom not found", one of them 519 MB.
+///
+/// The recorder now writes fragments, each carrying its own header, so a file is
+/// readable while it is still being written and survives a crash, a kill or a
+/// power cut. The save-offer race is still real and still handled by `bsr-ui`
+/// waiting for the muxer to finish; it is simply no longer detectable by the
+/// file being broken, because the file is no longer broken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_recording_is_not_playable_until_the_muxer_finishes() {
+async fn a_recording_in_progress_is_already_playable() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cfg = bsr_ipc::MuxerConfig {
+        extradata: encoder_extradata(),
         base_output_path: dir.path().to_path_buf(),
         file_naming_strategy: bsr_ipc::FileNamingStrategy::Simple("mid.mp4".into()),
         max_duration: Duration::from_secs(3600),
@@ -227,18 +244,20 @@ async fn a_recording_is_not_playable_until_the_muxer_finishes() {
         }
     }
 
-    // Mid-recording: bytes on disk, nothing requested a trailer, so it must NOT open.
+    // Mid-recording, with no stop requested: the file must already open and
+    // contain frames. This is what a crash, a kill or a power cut would leave.
     let mid_len = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     assert!(mid_len > 0, "the muxer should have written packet data by now");
     ffmpeg::init().expect("ffmpeg init");
+    let (mid_w, mid_h, mid_frames) = decode(&out);
+    assert_eq!((mid_w, mid_h), (SCREEN_W, SCREEN_H), "mid-recording geometry");
     assert!(
-        ffmpeg::format::input(&out).is_err(),
-        "a recording still in progress must not be playable ({mid_len} bytes) — if this \
-         ever passes, the save-offer race stops being detectable here"
+        mid_frames > 0,
+        "a recording in progress must already be playable ({mid_len} bytes decoded to no frames) — \
+         without this, any recording that does not end cleanly is lost"
     );
 
-    // Finishing the muxer is what makes it playable. This is the signal `bsr-ui` now
-    // waits for before offering the file to anyone.
+    // Finishing completes it; nothing already written may be lost.
     drop(packet_tx);
     tokio::time::timeout(Duration::from_secs(20), muxer)
         .await
@@ -248,7 +267,21 @@ async fn a_recording_is_not_playable_until_the_muxer_finishes() {
 
     let (w, h, frames) = decode(&out);
     assert_eq!((w, h), (SCREEN_W, SCREEN_H));
-    assert!(frames > 0, "playable only after the muxer completes");
+    assert!(
+        frames >= mid_frames,
+        "finishing lost frames: {mid_frames} mid-recording, {frames} afterwards"
+    );
+}
+
+/// The encoder's H.264 parameter sets, which the muxer requires: it refuses to
+/// write a file it cannot describe, because such a file cannot be played back.
+fn encoder_extradata() -> Option<Vec<u8>> {
+    let enc_cfg = EncoderConfig {
+        codec: "h264".into(), preset: "ultrafast".into(), bitrate_kbps: 2500,
+        width: SCREEN_W, height: SCREEN_H, fps: FPS,
+    };
+    let enc = H264EncoderBackend::new(&enc_cfg).expect("encoder init for parameter sets");
+    Some(enc.extradata().expect("encoder produced no parameter sets (GLOBAL_HEADER not honoured)"))
 }
 
 /// Container duration in seconds, as any player would read it.
@@ -284,6 +317,7 @@ async fn file_duration_matches_real_capture_time_when_capture_underruns() {
 
     let dir = tempfile::tempdir().expect("temp dir");
     let cfg = bsr_ipc::MuxerConfig {
+        extradata: encoder_extradata(),
         base_output_path: dir.path().to_path_buf(),
         file_naming_strategy: bsr_ipc::FileNamingStrategy::Simple("slow.mp4".into()),
         max_duration: Duration::from_secs(3600),

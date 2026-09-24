@@ -121,6 +121,11 @@ async fn a_live_preview_does_not_consume_the_recordings_frames() {
         enc_shutdown_rx,
     )
     .expect("encoder service");
+    // What bsr-ui does when a recording starts: the muxer cannot write a
+    // playable file without the encoder's H.264 parameter sets, and refuses to
+    // start rather than produce one that nothing can open.
+    mcfg.extradata = encoder.extradata();
+
     let enc_task = tokio::spawn(async move { encoder.run().await });
 
     // The bridge bsr-ui runs between the two packet types.

@@ -62,6 +62,7 @@ async fn e2e_encode_mux_mp4_is_decodable() {
 
     // 2) Mux to MP4 with the real muxer.
     let mux_cfg = bsr_ipc::MuxerConfig {
+        extradata: enc.extradata(),
         base_output_path: tmp.path().to_path_buf(),
         file_naming_strategy: bsr_ipc::FileNamingStrategy::Simple("e2e.mp4".into()),
         max_duration: std::time::Duration::from_secs(60),

@@ -75,6 +75,9 @@ async fn health_agrees_with_recording_state() {
 async fn muxer_config_survives_the_wire() {
     let h = TestHarness::new().await;
     let cfg = bsr_ipc::MuxerConfig {
+        // The muxer cannot write a playable file without these, so they must
+        // survive the wire like every other part of the contract.
+        extradata: Some(vec![0x01, 0x64, 0x00, 0x1f]),
         base_output_path: h.output_path("clips"),
         file_naming_strategy: bsr_ipc::FileNamingStrategy::Simple("take.mp4".into()),
         max_duration: Duration::from_secs(600),

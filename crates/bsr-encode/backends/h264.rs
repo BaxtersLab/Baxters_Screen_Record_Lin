@@ -86,6 +86,18 @@ impl H264EncoderBackend {
         video_encoder.set_frame_rate(Some(ffmpeg::Rational::new(config.fps as i32, 1)));
         video_encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
 
+        // Ask the encoder for the H.264 parameter sets (SPS/PPS) OUT OF BAND, as
+        // `extradata`, instead of only in-band inside keyframes.
+        //
+        // The container needs them to describe the stream. Without them an mp4
+        // is only readable because ffmpeg can recover the parameters from the
+        // data once a complete index exists at the end of the file -- so any
+        // recording that was not finalised cleanly is unreadable, and a
+        // fragmented or Matroska container refuses outright. Measured on the
+        // operator's own recordings, 2026-09-24: 6 of 21 unplayable, "moov atom
+        // not found", one of them 519 MB.
+        video_encoder.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
+
         let mut opts = ffmpeg::Dictionary::new();
         opts.set("preset", &config.preset);
         opts.set("tune", "zerolatency");
@@ -117,6 +129,21 @@ impl H264EncoderBackend {
             first_ts: None,
             last_pts: None,
         })
+    }
+
+    /// The H.264 parameter sets (SPS/PPS) the container must carry, available
+    /// once the encoder is open. `None` only if the encoder produced none,
+    /// which would mean GLOBAL_HEADER was not honoured.
+    pub fn extradata(&self) -> Option<Vec<u8>> {
+        unsafe {
+            let ptr = self.encoder.as_ptr();
+            let len = (*ptr).extradata_size as usize;
+            if len == 0 || (*ptr).extradata.is_null() {
+                None
+            } else {
+                Some(std::slice::from_raw_parts((*ptr).extradata, len).to_vec())
+            }
+        }
     }
 
     pub fn initialize(&mut self, _config: &EncoderConfig) -> Result<(), EncoderError> {

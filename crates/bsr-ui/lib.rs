@@ -328,6 +328,8 @@ impl UiSettings {
         let (width, height) = self.recording_size();
 
         bsr_ipc::MuxerConfig {
+            // Filled in when a recording starts, from the live encoder.
+            extradata: None,
             base_output_path: std::path::PathBuf::from(&self.output_folder),
             file_naming_strategy: strategy,
             max_duration: std::time::Duration::from_secs(5 * 60 * 60),
@@ -1937,6 +1939,10 @@ impl AppWindow {
         // filename now (includes monotonic fragment sequence) and record it
         // so the UI can offer it for saving later.
         let mut muxer_config = self.model.settings.to_muxer_config();
+        // Hand the encoder's H.264 parameter sets to the muxer. Without them the
+        // container describes nothing and the recording cannot be played back:
+        // the muxer refuses to start rather than produce such a file.
+        muxer_config.extradata = encoder_service.extradata();
         let timestamp = chrono::Utc::now().format("%Y-%m-%d_%H-%M-%S");
         let filename = format!("recording-{}-{}.mp4", timestamp, self.recording_seq);
         muxer_config.file_naming_strategy = bsr_ipc::FileNamingStrategy::Simple(filename.clone());

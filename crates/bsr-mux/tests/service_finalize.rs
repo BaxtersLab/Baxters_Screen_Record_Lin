@@ -38,7 +38,9 @@ fn make_frame(i: usize) -> CaptureFrame {
     CaptureFrame { data, timestamp: i as u64, width: W, height: H, format: FrameFormat::Bgra8 }
 }
 
-fn encode_packets() -> Vec<EncodedPacket> {
+/// Returns the packets AND the encoder's parameter sets, because a muxer
+/// cannot write a playable file without them.
+fn encode_packets() -> (Vec<EncodedPacket>, Option<Vec<u8>>) {
     let cfg = EncoderConfig {
         codec: "h264".into(),
         preset: "ultrafast".into(),
@@ -56,7 +58,9 @@ fn encode_packets() -> Vec<EncodedPacket> {
         }
     }
     assert!(!packets.is_empty(), "encoder produced no packets");
-    packets
+    let extradata = enc.extradata();
+    assert!(extradata.is_some(), "encoder produced no parameter sets");
+    (packets, extradata)
 }
 
 /// Independently demux + decode the file. This is the check that fails on a missing
@@ -114,7 +118,12 @@ async fn run_service_until_packets_end(
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path().to_path_buf();
 
+    // The encoder's parameter sets travel with the packets: the muxer refuses to
+    // write a file it cannot describe, which is what made recordings unplayable.
+    let (packets, extradata) = encode_packets();
+
     let mut config = bsr_ipc::MuxerConfig {
+        extradata,
         base_output_path: dir.clone(),
         file_naming_strategy: bsr_ipc::FileNamingStrategy::Simple("svc.mp4".into()),
         ..Default::default()
@@ -139,7 +148,7 @@ async fn run_service_until_packets_end(
     let service = MuxerService::new(config, Mp4Muxer::new(), packet_rx, telemetry_tx, cmd_rx, ipc_client);
     let task = tokio::spawn(async move { service.run().await });
 
-    for p in encode_packets() {
+    for p in packets {
         packet_tx.send(p).await.expect("muxer stopped accepting packets");
     }
 
