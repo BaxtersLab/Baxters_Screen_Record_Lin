@@ -14,7 +14,24 @@ HERE="$(dirname "$(readlink -f "$0")")"
 TREE="$(cd "$HERE/../.." && pwd)"
 
 PKG=baxters-screen-record
-VERSION="${BSR_DEB_VERSION:-1.0.0-1}"
+# The version lives in a FILE in the tree, not in a default. It used to read
+#     VERSION="${BSR_DEB_VERSION:-1.0.0-1}"
+# so anyone building without that variable set produced 1.0.0-1 -- a version
+# that goes BACKWARDS from the 1.0.0-14 already shipped. apt then refuses the
+# "upgrade", and a train picks whichever file sorts highest rather than the one
+# just built. Done accidentally on 2026-09-25 while adding a copyright file.
+VERSION="${BSR_DEB_VERSION:-$(cat "$(dirname "$(readlink -f "$0")")/VERSION")}"
+[ -n "$VERSION" ] || { echo "FATAL: packaging/deb/VERSION is empty" >&2; exit 1; }
+# Never regress against something already built.
+for _existing in "$(dirname "$(readlink -f "$0")")"/../../dist/baxters-screen-record_*.deb; do
+    [ -e "$_existing" ] || continue
+    _ev="$(dpkg-deb -f "$_existing" Version 2>/dev/null)" || continue
+    if dpkg --compare-versions "$_ev" gt "$VERSION"; then
+        echo "FATAL: $VERSION is older than $_ev, which is already built" >&2
+        echo "       bump packaging/deb/VERSION -- a lower version is not an upgrade" >&2
+        exit 1
+    fi
+done
 ARCH=amd64
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -160,5 +177,23 @@ chmod 0755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/postrm"
 
 OUT="$TREE/dist"
 mkdir -p "$OUT"
+
+# Debian policy requires every package to carry a copyright file. An audit
+# of the built .deb files on 2026-09-24 found five packages shipping
+# without one.
+install -d -m 0755 "$STAGE/usr/share/doc/$(awk '/^Package: /{print $2; exit}' "$STAGE/DEBIAN/control")"
+install -m 0644 "$(dirname "$(readlink -f "$0")")/copyright" "$STAGE/usr/share/doc/$(awk '/^Package: /{print $2; exit}' "$STAGE/DEBIAN/control")/copyright"
+
+# --- final hygiene sweep ---------------------------------------------------
+# `install -d -m 0755 <dir>` sets the mode on the LAST component only; the
+# parents it creates on the way (usr, usr/share, usr/share/doc) take the build
+# user's umask instead. Three packages shipped a group-writable
+# ./usr/share/doc/ that way, because the copyright step ran AFTER the hygiene
+# step. Hygiene therefore gets the last word, immediately before the build.
+chmod -R go-w "$STAGE"
+if [ -n "$(find "$STAGE" \( -type f -o -type d \) -perm -g+w -print -quit 2>/dev/null)" ]; then
+    echo "FATAL: group-writable entries remain at build time" >&2
+    exit 1
+fi
 dpkg-deb --build --root-owner-group "$STAGE" "$OUT/${PKG}_${VERSION}_${ARCH}.deb" >/dev/null
 echo "built $OUT/${PKG}_${VERSION}_${ARCH}.deb"
